@@ -54,25 +54,28 @@ type Config struct {
 type MsgType byte
 
 const (
-	MsgTransparent MsgType = 0x01
-	MsgResponse    MsgType = 0x02
-	MsgConnect     MsgType = 0x03
-	MsgConnectOK   MsgType = 0x04
-	MsgData        MsgType = 0x05
-	MsgClose       MsgType = 0x06
-	MsgError       MsgType = 0x07
+	MsgTransparent      MsgType = 0x01
+	MsgResponse         MsgType = 0x02
+	MsgConnect          MsgType = 0x03
+	MsgConnectOK        MsgType = 0x04
+	MsgData             MsgType = 0x05
+	MsgClose            MsgType = 0x06
+	MsgError            MsgType = 0x07
+	MsgResponseHeaders  MsgType = 0x08
 )
 
 // 协议帧格式: [2字节Magic][1字节Type][4字节StreamID][4字节Length][Data]
 // 帧同步魔数 — 用于检测和恢复帧边界
 const (
-	protocolMagic    = uint16(0xAA55)
-	maxMessageSize   = uint32(10 * 1024 * 1024)
-	readBufferSize   = 4096
-	streamChanSize   = 256
-	connectTimeout   = 10 * time.Second
-	proxyTimeout     = 30 * time.Second
-	dialTimeout      = 10 * time.Second
+	protocolMagic     = uint16(0xAA55)
+	maxMessageSize    = uint32(10 * 1024 * 1024)
+	readBufferSize    = 4096
+	streamChanSize    = 256
+	connectTimeout    = 10 * time.Second
+	proxyTimeout      = 30 * time.Second
+	dialTimeout       = 10 * time.Second
+	streamChunkSize   = 256
+	streamChunkTimeout = 300 * time.Second
 )
 
 // Go HTTP 自动管理响应头 — 不应从原始响应复制
@@ -402,12 +405,12 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 		msg.StreamID, req.URL.Scheme, req.URL.String())
 
 	client := &http.Client{
-		Timeout: proxyTimeout,
 		Transport: &http.Transport{
 			DialContext: (&net.Dialer{
 				Timeout:   dialTimeout,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
+			ResponseHeaderTimeout: proxyTimeout,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -422,23 +425,82 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	defer resp.Body.Close()
 	log.Printf("[SERVER-TRANSPARENT] stream=%d response: status=%d", msg.StreamID, resp.StatusCode)
 
-	respData, err := httputil.DumpResponse(resp, true)
+	if isStreamResponse(resp) {
+		sm.handleTransparentStream(msg.StreamID, resp)
+	} else {
+		respData, err := httputil.DumpResponse(resp, true)
+		if err != nil {
+			log.Printf("Dump response error: %v", err)
+			sm.sendError(msg.StreamID, err.Error())
+			return
+		}
+
+		compressed, err := compress(respData)
+		if err != nil {
+			log.Printf("Compress error: %v", err)
+			sm.sendError(msg.StreamID, "compress failed")
+			return
+		}
+
+		if err := sm.Send(Message{Type: MsgResponse, StreamID: msg.StreamID, Data: compressed}); err != nil {
+			log.Printf("Send response error: %v", err)
+		}
+	}
+}
+
+func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http.Response) {
+	headers := dumpResponseHeaders(resp)
+	compressed, err := compress(headers)
 	if err != nil {
-		log.Printf("Dump response error: %v", err)
-		sm.sendError(msg.StreamID, err.Error())
+		log.Printf("Compress headers error: %v", err)
+		sm.sendError(streamID, "compress headers failed")
+		return
+	}
+	if err := sm.Send(Message{Type: MsgResponseHeaders, StreamID: streamID, Data: compressed}); err != nil {
+		log.Printf("Send response headers error: %v", err)
 		return
 	}
 
-	compressed, err := compress(respData)
-	if err != nil {
-		log.Printf("Compress error: %v", err)
-		sm.sendError(msg.StreamID, "compress failed")
-		return
+	buf := make([]byte, streamChunkSize)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if sendErr := sm.Send(Message{Type: MsgData, StreamID: streamID, Data: buf[:n]}); sendErr != nil {
+				log.Printf("Send stream data error: %v", sendErr)
+				return
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Read stream body error: %v", err)
+				sm.sendError(streamID, err.Error())
+			}
+			break
+		}
 	}
+	sm.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
+}
 
-	if err := sm.Send(Message{Type: MsgResponse, StreamID: msg.StreamID, Data: compressed}); err != nil {
-		log.Printf("Send response error: %v", err)
+func isStreamResponse(resp *http.Response) bool {
+	return strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+}
+
+func dumpResponseHeaders(resp *http.Response) []byte {
+	var buf bytes.Buffer
+	buf.WriteString(resp.Proto)
+	buf.WriteByte(' ')
+	buf.WriteString(resp.Status)
+	buf.WriteString("\r\n")
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			buf.WriteString(k)
+			buf.WriteString(": ")
+			buf.WriteString(v)
+			buf.WriteString("\r\n")
+		}
 	}
+	buf.WriteString("\r\n")
+	return buf.Bytes()
 }
 
 // sendError 封装错误发送并检查返回值 [HIGH#5]
@@ -775,7 +837,12 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, string(msg.Data), http.StatusBadGateway)
 		return
 	}
-	// [HIGH#6] 严格验证消息类型
+
+	if msg.Type == MsgResponseHeaders {
+		p.handleStreamResponse(w, req, streamID, ch, msg)
+		return
+	}
+
 	if msg.Type != MsgResponse {
 		http.Error(w, fmt.Sprintf("unexpected message type: %d", msg.Type), http.StatusBadGateway)
 		return
@@ -796,7 +863,6 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// [MED#10] 复制响应头时过滤 Go 自动管理的头
 	for k, vv := range resp.Header {
 		lowerK := strings.ToLower(k)
 		if autoManagedHeaders[lowerK] {
@@ -809,6 +875,65 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	log.Printf("[TRANSPARENT] stream=%d returning to client: status=%d", streamID, resp.StatusCode)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http.Request, streamID uint32, ch chan Message, headersMsg Message) {
+	headersData, err := decompress(headersMsg.Data)
+	if err != nil {
+		http.Error(w, "decompress headers failed", http.StatusBadGateway)
+		return
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(headersData)), req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		lowerK := strings.ToLower(k)
+		if autoManagedHeaders[lowerK] {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	log.Printf("[TRANSPARENT] stream=%d streaming response: status=%d", streamID, resp.StatusCode)
+	w.WriteHeader(resp.StatusCode)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Printf("[TRANSPARENT] stream=%d Flusher not supported, streaming disabled", streamID)
+		return
+	}
+
+	for {
+		var m Message
+		select {
+		case m = <-ch:
+		case <-time.After(streamChunkTimeout):
+			log.Printf("[TRANSPARENT] stream=%d chunk timeout", streamID)
+			return
+		}
+
+		switch m.Type {
+		case MsgData:
+			if _, err := w.Write(m.Data); err != nil {
+				log.Printf("[TRANSPARENT] stream=%d write chunk error: %v", streamID, err)
+				return
+			}
+			flusher.Flush()
+		case MsgClose:
+			return
+		case MsgError:
+			log.Printf("[TRANSPARENT] stream=%d received error: %s", streamID, string(m.Data))
+			return
+		default:
+			log.Printf("[TRANSPARENT] stream=%d unexpected message type %d in stream", streamID, m.Type)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
