@@ -375,6 +375,7 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 		sm.sendError(msg.StreamID, "decompress failed")
 		return
 	}
+	log.Printf("[SERVER-TRANSPARENT] stream=%d received %d bytes\n%s", msg.StreamID, len(data), string(data))
 
 	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(data)))
 	if err != nil {
@@ -386,6 +387,9 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	// [FIX] 清空 RequestURI，http.Client.Do 禁止发送带 RequestURI 的请求
 	req.RequestURI = ""
 
+	log.Printf("[SERVER-TRANSPARENT] stream=%d parsed: method=%s url=%s scheme=%s host=%s requestURI=%s",
+		msg.StreamID, req.Method, req.URL.String(), req.URL.Scheme, req.URL.Host, req.RequestURI)
+
 	// 确保 URL 完整（某些请求可能是相对路径）
 	if req.URL.Scheme == "" {
 		req.URL.Scheme = "http"
@@ -393,6 +397,9 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	if req.URL.Host == "" {
 		req.URL.Host = req.Host
 	}
+
+	log.Printf("[SERVER-TRANSPARENT] stream=%d after fixup: scheme=%s url=%s -> making request",
+		msg.StreamID, req.URL.Scheme, req.URL.String())
 
 	client := &http.Client{
 		Timeout: proxyTimeout,
@@ -413,6 +420,7 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 		return
 	}
 	defer resp.Body.Close()
+	log.Printf("[SERVER-TRANSPARENT] stream=%d response: status=%d", msg.StreamID, resp.StatusCode)
 
 	respData, err := httputil.DumpResponse(resp, true)
 	if err != nil {
@@ -699,9 +707,11 @@ type reverseProxy struct {
 }
 
 func (p *reverseProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	log.Printf("[REVERSE] original: method=%s host=%s url=%s scheme=%s", req.Method, req.Host, req.URL.String(), req.URL.Scheme)
 	req.URL.Scheme = p.upstream.Scheme
 	req.URL.Host = p.upstream.Host
 	req.Host = p.upstream.Host
+	log.Printf("[REVERSE] rewritten: scheme=%s host=%s url=%s", req.URL.Scheme, req.URL.Host, req.URL.String())
 	(&transparentProxy{mux: p.mux}).ServeHTTP(w, req)
 }
 
@@ -725,13 +735,15 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		req.URL.Host = req.Host
 	}
 
-	dump, err := httputil.DumpRequest(req, true)
+	dump, err := httputil.DumpRequestOut(req, true)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	streamID := p.mux.AllocStreamID()
+	log.Printf("[TRANSPARENT] stream=%d dumped request (%d bytes):\n%s", streamID, len(dump), string(dump))
+
 	ch, ok := p.mux.OpenStream(streamID)
 	if !ok {
 		http.Error(w, "stream allocation failed", http.StatusInternalServerError)
@@ -775,6 +787,8 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	log.Printf("[TRANSPARENT] stream=%d received response (%d bytes):\n%s", streamID, len(data), string(data))
+
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(data)), req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -792,6 +806,7 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
+	log.Printf("[TRANSPARENT] stream=%d returning to client: status=%d", streamID, resp.StatusCode)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
