@@ -42,11 +42,10 @@ import (
 )
 
 type Config struct {
-	Role              string
-	SerialDevice      string
-	BaudRate          int
-	ProxyListen       string
-	TransparentListen string
+	Role         string
+	SerialDevice string
+	BaudRate     int
+	ProxyListen  string
 }
 
 type MsgType byte
@@ -689,6 +688,18 @@ type transparentProxy struct {
 	mux *SerialMultiplexer
 }
 
+type unifiedProxy struct {
+	mux *SerialMultiplexer
+}
+
+func (p *unifiedProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method == http.MethodConnect {
+		(&connectProxy{mux: p.mux}).ServeHTTP(w, req)
+	} else {
+		(&transparentProxy{mux: p.mux}).ServeHTTP(w, req)
+	}
+}
+
 func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.URL.Scheme == "" {
 		req.URL.Scheme = "http"
@@ -777,8 +788,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.Role, "role", "client", "Role: client or server")
 	flag.StringVar(&cfg.SerialDevice, "serial", "/dev/ttyUSB0", "Serial device path")
 	flag.IntVar(&cfg.BaudRate, "baud", 115200, "Baud rate")
-	flag.StringVar(&cfg.ProxyListen, "proxy-listen", ":8080", "CONNECT proxy listen address")
-	flag.StringVar(&cfg.TransparentListen, "transparent-listen", ":8081", "Transparent proxy listen address")
+	flag.StringVar(&cfg.ProxyListen, "proxy-listen", ":8080", "Proxy listen address (supports CONNECT + transparent)")
 	flag.Parse()
 	return cfg
 }
@@ -809,7 +819,7 @@ func main() {
 	log.Printf("Starting as %s", cfg.Role)
 	log.Printf("Serial: %s @ %d baud", cfg.SerialDevice, cfg.BaudRate)
 	log.Printf("Protocol: magic=0x%04X, header=11 bytes", protocolMagic)
-	log.Printf("Proxy listen: %s, Transparent listen: %s", cfg.ProxyListen, cfg.TransparentListen)
+	log.Printf("Proxy listen: %s (CONNECT + transparent)", cfg.ProxyListen)
 
 	serialConn, err := openSerial(cfg.SerialDevice, cfg.BaudRate)
 	if err != nil {
@@ -842,65 +852,22 @@ func main() {
 }
 
 func runClient(ctx context.Context, cfg *Config, mux *SerialMultiplexer) {
-	var wg sync.WaitGroup
-	serverDone := make(chan struct{})
-	serverCount := 0
-
-	if cfg.ProxyListen != "" {
-		serverCount++
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			log.Printf("CONNECT proxy listening on %s", cfg.ProxyListen)
-			srv := &http.Server{
-				Addr:    cfg.ProxyListen,
-				Handler: &connectProxy{mux: mux},
-			}
-			go func() {
-				<-ctx.Done()
-				srv.Close()
-			}()
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("CONNECT proxy error: %v", err)
-			}
-		}()
+	if cfg.ProxyListen == "" {
+		log.Fatal("proxy-listen is required for client")
 	}
 
-	if cfg.TransparentListen != "" {
-		serverCount++
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			log.Printf("Transparent proxy listening on %s", cfg.TransparentListen)
-			srv := &http.Server{
-				Addr:    cfg.TransparentListen,
-				Handler: &transparentProxy{mux: mux},
-			}
-			go func() {
-				<-ctx.Done()
-				srv.Close()
-			}()
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("Transparent proxy error: %v", err)
-			}
-		}()
+	log.Printf("Proxy listening on %s (CONNECT + transparent)", cfg.ProxyListen)
+	srv := &http.Server{
+		Addr:    cfg.ProxyListen,
+		Handler: &unifiedProxy{mux: mux},
 	}
-
-	// 等待 context 取消或所有服务器退出
 	go func() {
-		wg.Wait()
-		close(serverDone)
+		<-ctx.Done()
+		srv.Close()
 	}()
 
-	select {
-	case <-ctx.Done():
-		// 等待服务器优雅关闭（最多5秒）
-		select {
-		case <-serverDone:
-		case <-time.After(5 * time.Second):
-			log.Println("Server shutdown timeout")
-		}
-	case <-serverDone:
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Proxy error: %v", err)
 	}
 }
 
