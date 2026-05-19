@@ -29,6 +29,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"net/http/httputil"
 	"os"
 	"os/signal"
@@ -42,10 +43,12 @@ import (
 )
 
 type Config struct {
-	Role         string
-	SerialDevice string
-	BaudRate     int
-	ProxyListen  string
+	Role            string
+	SerialDevice    string
+	BaudRate        int
+	ProxyListen     string
+	ReverseUpstream string
+	ReverseListen   string
 }
 
 type MsgType byte
@@ -688,6 +691,20 @@ type transparentProxy struct {
 	mux *SerialMultiplexer
 }
 
+// Client: 反向代理 — 将请求重写目标后走透明代理通道
+
+type reverseProxy struct {
+	mux      *SerialMultiplexer
+	upstream *url.URL
+}
+
+func (p *reverseProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	req.URL.Scheme = p.upstream.Scheme
+	req.URL.Host = p.upstream.Host
+	req.Host = p.upstream.Host
+	(&transparentProxy{mux: p.mux}).ServeHTTP(w, req)
+}
+
 type unifiedProxy struct {
 	mux *SerialMultiplexer
 }
@@ -789,6 +806,8 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.SerialDevice, "serial", "/dev/ttyUSB0", "Serial device path")
 	flag.IntVar(&cfg.BaudRate, "baud", 115200, "Baud rate")
 	flag.StringVar(&cfg.ProxyListen, "proxy-listen", ":8080", "Proxy listen address (supports CONNECT + transparent)")
+	flag.StringVar(&cfg.ReverseUpstream, "reverse-upstream", "https://api.deepseek.com", "Reverse proxy upstream URL")
+	flag.StringVar(&cfg.ReverseListen, "reverse-listen", ":8081", "Reverse proxy listen address (empty to disable)")
 	flag.Parse()
 	return cfg
 }
@@ -856,19 +875,55 @@ func runClient(ctx context.Context, cfg *Config, mux *SerialMultiplexer) {
 		log.Fatal("proxy-listen is required for client")
 	}
 
-	log.Printf("Proxy listening on %s (CONNECT + transparent)", cfg.ProxyListen)
-	srv := &http.Server{
-		Addr:    cfg.ProxyListen,
-		Handler: &unifiedProxy{mux: mux},
-	}
+	var wg sync.WaitGroup
+
+	// 统一代理端口 (CONNECT + 透明)
+	wg.Add(1)
 	go func() {
-		<-ctx.Done()
-		srv.Close()
+		defer wg.Done()
+		log.Printf("Proxy listening on %s (CONNECT + transparent)", cfg.ProxyListen)
+		srv := &http.Server{
+			Addr:    cfg.ProxyListen,
+			Handler: &unifiedProxy{mux: mux},
+		}
+		go func() {
+			<-ctx.Done()
+			srv.Close()
+		}()
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Proxy error: %v", err)
+		}
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Proxy error: %v", err)
+	// 反向代理端口
+	if cfg.ReverseListen != "" && cfg.ReverseUpstream != "" {
+		upstreamURL, err := url.Parse(cfg.ReverseUpstream)
+		if err != nil {
+			log.Fatalf("Invalid reverse-upstream URL: %v", err)
+		}
+		if upstreamURL.Host == "" || upstreamURL.Scheme == "" {
+			log.Fatal("reverse-upstream must be a full URL (e.g. https://api.deepseek.com)")
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Printf("Reverse proxy listening on %s -> %s", cfg.ReverseListen, cfg.ReverseUpstream)
+			srv := &http.Server{
+				Addr:    cfg.ReverseListen,
+				Handler: &reverseProxy{mux: mux, upstream: upstreamURL},
+			}
+			go func() {
+				<-ctx.Done()
+				srv.Close()
+			}()
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("Reverse proxy error: %v", err)
+			}
+		}()
 	}
+
+	wg.Wait()
 }
 
 func runServer(ctx context.Context, cfg *Config, mux *SerialMultiplexer) {

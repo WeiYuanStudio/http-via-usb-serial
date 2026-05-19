@@ -8,8 +8,8 @@
 - **用途**: 离线电脑通过 USB 串口连接到有外网的电脑，访问互联网
 - **语言**: Go
 - **功能**:
-  - CONNECT 代理 (支持 HTTP/HTTPS)
-  - 透明代理 (支持 HTTP)
+  - 统一代理 (端口同时支持 CONNECT + 透明代理)
+  - 反向代理 (将请求转发到指定上游，如 API 地址)
 
 ## 编译
 
@@ -25,8 +25,7 @@ go build -o http-proxy main.go
 ./http-proxy --role server \
   --serial /dev/ttyUSB0 \
   --baud 115200 \
-  --proxy-listen :8080 \
-  --transparent-listen :8081
+  --proxy-listen :8080
 ```
 
 ### 内网机 (Client)
@@ -35,8 +34,7 @@ go build -o http-proxy main.go
 ./http-proxy --role client \
   --serial /dev/ttyUSB0 \
   --baud 115200 \
-  --proxy-listen :8080 \
-  --transparent-listen :8081
+  --proxy-listen :8080
 ```
 
 ## 参数说明
@@ -46,8 +44,9 @@ go build -o http-proxy main.go
 | `--role` | `client` | 角色: `client`(内网机) 或 `server`(外网机) |
 | `--serial` | `/dev/ttyUSB0` | 串口设备路径 |
 | `--baud` | `115200` | 波特率 |
-| `--proxy-listen` | `:8080` | CONNECT 代理监听地址 (留空禁用) |
-| `--transparent-listen` | `:8081` | 透明代理监听地址 (留空禁用) |
+| `--proxy-listen` | `:8080` | 统一代理监听地址，同时支持 CONNECT + 透明代理 (留空禁用) |
+| `--reverse-upstream` | `https://api.deepseek.com` | 反向代理上游地址 |
+| `--reverse-listen` | `:8081` | 反向代理监听地址 (留空禁用) |
 | `--allow-lan` | `false` | 是否允许局域网其他设备访问 |
 
 ## 通信协议
@@ -85,6 +84,11 @@ go build -o http-proxy main.go
    - 收到 `MsgData` 后写给目标服务器/浏览器
    - 连接关闭时发送 `MsgClose`
 
+### 反向代理流程
+
+1. Client 收到请求后，将 Host/Scheme 改写为配置的上游地址
+2. 后续流程与透明代理相同，通过 `MsgTransparent` / `MsgResponse` 收发
+
 ## 使用示例
 
 ### 方法一: 设置系统代理 (透明代理)
@@ -92,14 +96,27 @@ go build -o http-proxy main.go
 在内网机上设置 HTTP_PROXY 环境变量或系统代理:
 
 ```bash
-export http_proxy=http://127.0.0.1:8081
-export https_proxy=http://127.0.0.1:8081
+export http_proxy=http://127.0.0.1:8080
+export https_proxy=http://127.0.0.1:8080
 ```
 
 ### 方法二: 使用 CONNECT 代理
 
 ```bash
 curl --proxy http://127.0.0.1:8080 https://example.com
+```
+
+### 方法三: 使用反向代理端口
+
+在内网机 GUI 中直接将 API 地址填写为反向代理地址:
+
+```bash
+# 启动时配置反向代理
+./http-proxy --role client \
+  --reverse-upstream https://api.deepseek.com \
+  --reverse-listen :8081
+
+# 内网 GUI 中 API 地址填写 http://127.0.0.1:8081
 ```
 
 ## 注意事项

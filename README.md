@@ -4,8 +4,8 @@
 
 ## 功能
 
-- **CONNECT 代理** (`:8080`)：支持 HTTP/HTTPS，浏览器/应用设置代理后使用
-- **透明代理** (`:8081`)：支持 HTTP，通过设置系统代理使用
+- **统一代理** (`:8080`)：同时支持 CONNECT 代理 (HTTP/HTTPS) 和透明代理 (HTTP)
+- **反向代理** (`:8081`)：将请求自动转发到指定上游（如 API 地址）
 - **串口多路复用**：多个请求通过流 ID 并发传输
 - **数据压缩**：透明代理流量使用 gzip 压缩，减少串口传输量
 
@@ -31,8 +31,7 @@ go build -o http-proxy main.go
 ./http-proxy --role server \
   --serial /dev/ttyUSB0 \
   --baud 115200 \
-  --proxy-listen :8080 \
-  --transparent-listen :8081
+  --proxy-listen :8080
 ```
 
 ### 内网机（Client）
@@ -41,8 +40,7 @@ go build -o http-proxy main.go
 ./http-proxy --role client \
   --serial /dev/ttyUSB0 \
   --baud 115200 \
-  --proxy-listen :8080 \
-  --transparent-listen :8081
+  --proxy-listen :8080
 ```
 
 ### 参数说明
@@ -52,8 +50,9 @@ go build -o http-proxy main.go
 | `--role` | `client` | 角色：`client`（内网机）或 `server`（外网机） |
 | `--serial` | `/dev/ttyUSB0` | 串口设备路径 |
 | `--baud` | `115200` | 波特率 |
-| `--proxy-listen` | `:8080` | CONNECT 代理监听地址（留空禁用） |
-| `--transparent-listen` | `:8081` | 透明代理监听地址（留空禁用） |
+| `--proxy-listen` | `:8080` | 统一代理监听地址，同时支持 CONNECT + 透明代理（留空禁用） |
+| `--reverse-upstream` | `https://api.deepseek.com` | 反向代理上游地址 |
+| `--reverse-listen` | `:8081` | 反向代理监听地址（留空禁用） |
 
 macOS 串口通常为 `/dev/tty.usbserial-*` 或 `/dev/cu.usbserial-*`。
 
@@ -64,11 +63,11 @@ macOS 串口通常为 `/dev/tty.usbserial-*` 或 `/dev/cu.usbserial-*`。
 在内网机上设置环境变量或系统代理：
 
 ```bash
-export http_proxy=http://127.0.0.1:8081
-export https_proxy=http://127.0.0.1:8081
+export http_proxy=http://127.0.0.1:8080
+export https_proxy=http://127.0.0.1:8080
 ```
 
-> 注意：透明代理不支持 HTTPS，HTTPS 网站请使用下方的 CONNECT 代理。
+> 注意：透明代理不支持 HTTPS，HTTPS 网站 curl 会自动切到 CONNECT 代理。
 
 ### 方法二：curl / wget（CONNECT 代理）
 
@@ -80,12 +79,25 @@ curl --proxy http://127.0.0.1:8080 https://example.com
 
 在浏览器或系统网络设置中，配置 HTTP/HTTPS 代理为 `127.0.0.1:8080`。
 
+### 方法四：反向代理端口
+
+在内网机 GUI 中将 API 地址直接填写为反向代理地址：
+
+```bash
+# 启动客户端时配置反向代理
+./http-proxy --role client \
+  --reverse-upstream https://api.deepseek.com \
+  --reverse-listen :8081
+
+# GUI 中 API 地址填写 http://127.0.0.1:8081
+```
+
 ## 注意事项
 
 1. **串口权限**：Linux/macOS 可能需要将用户加入 `dialout` 组，或使用 `sudo`
 2. **波特率**：建议使用 115200 或更高波特率以获得更好性能
 3. **带宽限制**：串口速度有限，不适合大文件下载或视频播放
-4. **HTTPS 必须走 CONNECT 代理**：透明代理（`8081`）只支持 HTTP
+4. **HTTPS 走 CONNECT 代理**：透明代理只支持 HTTP，HTTPS 需通过 8080 端口的 CONNECT 模式（curl 自动处理）
 
 ## 协议简介
 
