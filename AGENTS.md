@@ -48,6 +48,7 @@ go build -o http-proxy main.go
 | `--baud` | `115200` | 波特率 |
 | `--proxy-listen` | `:8080` | CONNECT 代理监听地址 (留空禁用) |
 | `--transparent-listen` | `:8081` | 透明代理监听地址 (留空禁用) |
+| `--allow-lan` | `false` | 是否允许局域网其他设备访问 |
 
 ## 通信协议
 

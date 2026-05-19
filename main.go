@@ -27,6 +27,7 @@ type Config struct {
 	BaudRate          int
 	ProxyListen       string
 	TransparentListen string
+	AllowLAN          bool
 }
 
 type MsgType byte
@@ -500,6 +501,7 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.BaudRate, "baud", 115200, "Baud rate")
 	flag.StringVar(&cfg.ProxyListen, "proxy-listen", ":8080", "CONNECT proxy listen address")
 	flag.StringVar(&cfg.TransparentListen, "transparent-listen", ":8081", "Transparent proxy listen address")
+	flag.BoolVar(&cfg.AllowLAN, "allow-lan", false, "Allow LAN connections (listen on 0.0.0.0)")
 	flag.Parse()
 	return cfg
 }
@@ -518,7 +520,7 @@ func main() {
 
 	log.Printf("Starting as %s", cfg.Role)
 	log.Printf("Serial: %s @ %d baud", cfg.SerialDevice, cfg.BaudRate)
-	log.Printf("Proxy listen: %s, Transparent listen: %s", cfg.ProxyListen, cfg.TransparentListen)
+	log.Printf("Proxy listen: %s, Transparent listen: %s, AllowLAN: %v", cfg.ProxyListen, cfg.TransparentListen, cfg.AllowLAN)
 
 	serialConn, err := openSerial(cfg.SerialDevice, cfg.BaudRate)
 	if err != nil {
@@ -546,23 +548,31 @@ func main() {
 func runClient(cfg *Config, mux *SerialMultiplexer) {
 	var wg sync.WaitGroup
 
-	if cfg.ProxyListen != "" {
+	addr := cfg.ProxyListen
+	if !cfg.AllowLAN && addr != "" && addr[0] == ':' {
+		addr = "127.0.0.1" + addr
+	}
+	if addr != "" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			log.Printf("CONNECT proxy listening on %s", cfg.ProxyListen)
-			if err := http.ListenAndServe(cfg.ProxyListen, &connectProxy{mux: mux}); err != nil {
+			log.Printf("CONNECT proxy listening on %s", addr)
+			if err := http.ListenAndServe(addr, &connectProxy{mux: mux}); err != nil {
 				log.Fatalf("CONNECT proxy error: %v", err)
 			}
 		}()
 	}
 
-	if cfg.TransparentListen != "" {
+	addr = cfg.TransparentListen
+	if !cfg.AllowLAN && addr != "" && addr[0] == ':' {
+		addr = "127.0.0.1" + addr
+	}
+	if addr != "" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			log.Printf("Transparent proxy listening on %s", cfg.TransparentListen)
-			if err := http.ListenAndServe(cfg.TransparentListen, &transparentProxy{mux: mux}); err != nil {
+			log.Printf("Transparent proxy listening on %s", addr)
+			if err := http.ListenAndServe(addr, &transparentProxy{mux: mux}); err != nil {
 				log.Fatalf("Transparent proxy error: %v", err)
 			}
 		}()
