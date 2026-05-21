@@ -141,8 +141,10 @@ func (sm *SerialMultiplexer) writeMessage(w io.Writer, msg Message) error {
 
 	sm.storeSendBuf(seqNum, msg.StreamID, buf)
 
-	_, err := w.Write(buf)
-	return err
+	if err := writeFull(w, buf); err != nil {
+		return err
+	}
+	return nil
 }
 
 // readMessage 读取完整消息（对外兼容，不处理重传逻辑）
@@ -164,6 +166,7 @@ func readMessage(r io.Reader) (Message, error) {
 
 type SerialMultiplexer struct {
 	conn       io.ReadWriteCloser
+	scanBuf    []byte
 	writeMu    sync.Mutex
 	streams    map[uint32]chan Message
 	streamsMu  sync.RWMutex
@@ -176,6 +179,19 @@ type SerialMultiplexer struct {
 	sendBufMu    sync.Mutex
 	processedSeq map[uint32]bool
 	processedMu  sync.Mutex
+}
+
+func writeFull(w io.Writer, buf []byte) error {
+	for written := 0; written < len(buf); {
+		n, err := w.Write(buf[written:])
+		if n > 0 {
+			written += n
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func NewSerialMultiplexer(conn io.ReadWriteCloser, isClient bool) *SerialMultiplexer {
@@ -245,107 +261,83 @@ func (sm *SerialMultiplexer) readLoop() {
 }
 
 func (sm *SerialMultiplexer) readMessageSync() (Message, error) {
+	searchPos := 0
 	for {
-		header := make([]byte, 15)
-		if _, err := io.ReadFull(sm.conn, header); err != nil {
-			return Message{}, err
-		}
-		magic := binary.BigEndian.Uint16(header[0:2])
-		if magic != protocolMagic {
-			return sm.resync(header)
+		for searchPos+15 <= len(sm.scanBuf) {
+			if binary.BigEndian.Uint16(sm.scanBuf[searchPos:searchPos+2]) != protocolMagic {
+				searchPos++
+				continue
+			}
+			msgType := sm.scanBuf[searchPos+2]
+			if msgType < 1 || msgType > 9 {
+				searchPos++
+				continue
+			}
+			length := binary.BigEndian.Uint32(sm.scanBuf[searchPos+7 : searchPos+11])
+			if length > maxMessageSize {
+				searchPos++
+				continue
+			}
+
+			totalNeeded := searchPos + 15 + int(length) + 4
+			if totalNeeded > len(sm.scanBuf) {
+				break
+			}
+
+			bodyStart := searchPos + 15
+			bodyEnd := bodyStart + int(length)
+			body := sm.scanBuf[bodyStart:bodyEnd]
+			crcBytes := sm.scanBuf[bodyEnd:totalNeeded]
+
+			if binary.BigEndian.Uint32(crcBytes) != crc32.ChecksumIEEE(body) {
+				seqNum := binary.BigEndian.Uint32(sm.scanBuf[searchPos+11 : searchPos+15])
+				streamID := binary.BigEndian.Uint32(sm.scanBuf[searchPos+3 : searchPos+7])
+				if streamID != 0 {
+					sm.requestRetransmit(seqNum)
+				}
+				log.Printf("Bad CRC: seq=%d stream=%d type=%d len=%d, requesting retransmit", seqNum, streamID, msgType, length)
+				searchPos++
+				continue
+			}
+
+			seqNum := binary.BigEndian.Uint32(sm.scanBuf[searchPos+11 : searchPos+15])
+			msg := Message{
+				Type:     MsgType(msgType),
+				StreamID: binary.BigEndian.Uint32(sm.scanBuf[searchPos+3 : searchPos+7]),
+				Data:     make([]byte, length),
+			}
+			if length > 0 {
+				copy(msg.Data, body)
+			}
+
+			sm.scanBuf = sm.scanBuf[totalNeeded:]
+			searchPos = 0
+
+			if sm.isProcessed(seqNum) {
+				continue
+			}
+			sm.markProcessed(seqNum)
+			return msg, nil
 		}
 
-		msgType := MsgType(header[2])
-		streamID := binary.BigEndian.Uint32(header[3:7])
-		length := binary.BigEndian.Uint32(header[7:11])
-		seqNum := binary.BigEndian.Uint32(header[11:15])
-
-		if length > maxMessageSize {
-			continue
+		if searchPos > 65536 {
+			sm.scanBuf = sm.scanBuf[searchPos:]
+			searchPos = 0
 		}
 
-		var data []byte
-		if length > 0 {
-			data = make([]byte, length)
-			if _, err := io.ReadFull(sm.conn, data); err != nil {
+		tmp := make([]byte, 65536)
+		n, err := sm.conn.Read(tmp)
+		if n > 0 {
+			sm.scanBuf = append(sm.scanBuf, tmp[:n]...)
+		}
+		if err != nil {
+			if err == io.EOF {
 				return Message{}, err
 			}
-		}
-
-		crcBytes := make([]byte, 4)
-		if _, err := io.ReadFull(sm.conn, crcBytes); err != nil {
-			return Message{}, err
-		}
-
-		expectedCRC := binary.BigEndian.Uint32(crcBytes)
-		actualCRC := crc32.ChecksumIEEE(data)
-		if expectedCRC != actualCRC {
-			if streamID != 0 {
-				sm.requestRetransmit(seqNum)
-			}
-			log.Printf("Bad CRC: seq=%d stream=%d type=%d len=%d, requesting retransmit", seqNum, streamID, msgType, length)
+			log.Printf("Serial read error in scan loop: %v", err)
 			continue
 		}
-
-		if sm.isProcessed(seqNum) {
-			continue
-		}
-		sm.markProcessed(seqNum)
-
-		return Message{Type: msgType, StreamID: streamID, Data: data}, nil
 	}
-}
-
-func (sm *SerialMultiplexer) resync(partial []byte) (Message, error) {
-	log.Println("Frame desync detected, entering resync mode...")
-
-	window := make([]byte, 0, 30)
-	for _, b := range partial {
-		window = append(window, b)
-		if header := checkWindow(window); header != nil {
-			msg, err := parseMessageBody(sm.conn, header)
-			if err == nil {
-				log.Println("Frame sync recovered")
-				return msg, nil
-			}
-		}
-	}
-
-	buf := make([]byte, 1)
-	scanLimit := int(maxMessageSize) + 30
-	for scanned := 0; scanned < scanLimit; scanned++ {
-		_, err := io.ReadFull(sm.conn, buf)
-		if err != nil {
-			return Message{}, fmt.Errorf("resync failed: %w", err)
-		}
-		window = append(window, buf[0])
-		if len(window) > 30 {
-			window = window[1:]
-		}
-		if header := checkWindow(window); header != nil {
-			msg, err := parseMessageBody(sm.conn, header)
-			if err == nil {
-				log.Println("Frame sync recovered")
-				return msg, nil
-			}
-		}
-	}
-	return Message{}, fmt.Errorf("resync exceeded scan limit (%d bytes)", scanLimit)
-}
-
-func checkWindow(window []byte) []byte {
-	if len(window) < 15 {
-		return nil
-	}
-	candidate := window[len(window)-15:]
-	if binary.BigEndian.Uint16(candidate[0:2]) != protocolMagic {
-		return nil
-	}
-	length := binary.BigEndian.Uint32(candidate[7:11])
-	if length > maxMessageSize {
-		return nil
-	}
-	return candidate
 }
 
 func parseMessageBody(r io.Reader, header []byte) (Message, error) {
@@ -485,7 +477,9 @@ func (sm *SerialMultiplexer) handleMsgRetransmit(msg Message) {
 
 	log.Printf("[RETRANSMIT] Resending seq=%d stream=%d retry=%d/%d", seqNum, entry.streamID, entry.retries, maxRetries)
 	sm.writeMu.Lock()
-	sm.conn.Write(frameCopy)
+	if err := writeFull(sm.conn, frameCopy); err != nil {
+		log.Printf("[RETRANSMIT] seq=%d stream=%d write error: %v", seqNum, entry.streamID, err)
+	}
 	sm.writeMu.Unlock()
 }
 
@@ -1053,7 +1047,7 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	log.Printf("[TRANSPARENT] stream=%d received response (%d bytes):\n%s", streamID, len(data), string(data))
+	// log.Printf("[TRANSPARENT] stream=%d received response (%d bytes):\n%s", streamID, len(data), string(data))
 
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(data)), req)
 	if err != nil {
