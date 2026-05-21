@@ -51,8 +51,11 @@ go build -o http-proxy main.go
 
 ## 通信协议
 
-- 消息格式: `[2字节Magic(0x39C5)][1字节类型][4字节流ID][4字节长度][数据]`
+- 消息格式: `[2字节Magic(0x39C5)][1字节类型][4字节流ID][4字节长度][4字节序列号][数据][4字节CRC32]`
 - 流ID: Client 使用奇数 (1,3,5...)，用于多路复用多个并发连接
+- 序列号: 单调递增，每帧一个，用于重传时定位丢失的帧
+- CRC32: IEEE 802.3 标准，覆盖数据部分，检测传输错误
+- 重传缓冲区: 环形缓冲 2048 条目，单帧最多重试 5 次，超限后放弃该帧并发送 MsgError
 - 数据压缩: 透明代理请求/响应用 gzip 压缩，CONNECT 流数据不压缩
 
 ### 消息类型
@@ -67,6 +70,7 @@ go build -o http-proxy main.go
 | `MsgClose` | `0x06` | 流关闭通知 | 双向 |
 | `MsgError` | `0x07` | 错误响应 | Server → Client |
 | `MsgResponseHeaders` | `0x08` | 流式响应头（用于 SSE 流，随后用 MsgData 发送数据块） | Server → Client |
+| `MsgRetransmit` | `0x09` | 重传请求 (data=4字节序列号，streamID=0) | 双向 |
 
 ### 透明代理流程
 
@@ -89,6 +93,26 @@ go build -o http-proxy main.go
 
 1. Client 收到请求后，将 Host/Scheme 改写为配置的上游地址
 2. 后续流程与透明代理相同，通过 `MsgTransparent` / `MsgResponse` 收发
+
+### 重传流程
+
+1. 发送端每发一帧，将其存入环形发送缓冲区（2048 条目，按 SeqNum 索引）
+2. 接收端读帧后校验 CRC32：
+   - CRC 正确：deliver 到上层，记录 SeqNum 为已处理
+   - CRC 错误：发送 `MsgRetransmit(SeqNum)` 请求重传（不阻塞其他帧）
+3. 发送端收到 `MsgRetransmit`：
+   - 从发送缓冲区查找对应 SeqNum，重新发送原始帧
+   - 重试次数 < 5：计数器 +1，继续重试
+   - 重试次数 >= 5：放弃该帧，发送 MsgError 通知对端
+
+### HTTPS 自动升级
+
+1. 透明代理首次访问某 host 时，优先使用 HTTP 发送请求
+2. Server 端收到 HTTP 响应，若为 3xx 重定向且 Location 头包含 https：
+   - 记录该 host 到内存 Map（标记为需要 HTTPS）
+   - 自动用 HTTPS 重试该请求
+3. 后续同一 host 的请求直接走 HTTPS，不再尝试 HTTP
+4. Map 为内存存储，重启后清零
 
 ## 使用示例
 
@@ -123,9 +147,10 @@ curl --proxy http://127.0.0.1:8080 https://example.com
 ## 注意事项
 
 1. 确保串口权限正确 (可能需要加入 dialout 用户组)
-2. 透明代理只支持 HTTP，HTTPS 需要用 CONNECT 代理
-3. 建议使用较高波特率 (115200+) 以获得更好性能
+2. 透明代理支持 HTTPS 自动升级（HTTP 遇 302 重定向自动切换）；CONNECT 代理原生支持 HTTPS
+3. 建议使用较高波特率 (115200+) 以获得更好性能；高波特率下 CRC 校验可检测数据损坏
 4. 串口带宽有限，大文件传输会比较慢
+5. 新旧协议帧格式不兼容，两端必须同时升级
 
 ## 依赖
 

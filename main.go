@@ -6,14 +6,16 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -37,31 +39,35 @@ type Config struct {
 type MsgType byte
 
 const (
-	MsgTransparent     MsgType = 0x01 // 透明代理 HTTP 请求 (Client → Server)
-	MsgResponse        MsgType = 0x02 // 透明代理 HTTP 响应 (Server → Client)
-	MsgConnect         MsgType = 0x03 // CONNECT 打开请求, data=host:port (Client → Server)
-	MsgConnectOK       MsgType = 0x04 // CONNECT 建立成功 (Server → Client)
-	MsgData            MsgType = 0x05 // TCP 流数据 (双向)
-	MsgClose           MsgType = 0x06 // 流关闭通知 (双向)
-	MsgError           MsgType = 0x07 // 错误响应 (Server → Client)
-	MsgResponseHeaders MsgType = 0x08 // 流式响应头 (Server → Client)
+	MsgTransparent     MsgType = 0x01
+	MsgResponse        MsgType = 0x02
+	MsgConnect         MsgType = 0x03
+	MsgConnectOK       MsgType = 0x04
+	MsgData            MsgType = 0x05
+	MsgClose           MsgType = 0x06
+	MsgError           MsgType = 0x07
+	MsgResponseHeaders MsgType = 0x08
+	MsgRetransmit      MsgType = 0x09
 )
 
-// 协议帧格式: [2字节Magic][1字节Type][4字节StreamID][4字节Length][Data]
-// 帧同步魔数 — 用于检测和恢复帧边界
+// 帧格式: [2B Magic][1B Type][4B StreamID][4B Length][4B SeqNum][Data][4B CRC32]
+// CRC32 covers Data only; header is protected by Magic + resync
 const (
-	protocolMagic     = uint16(0x39C5)
-	maxMessageSize    = uint32(10 * 1024 * 1024)
-	readBufferSize    = 4096
-	streamChanSize    = 256
-	connectTimeout    = 10 * time.Second
-	proxyTimeout      = 30 * time.Second
-	dialTimeout       = 10 * time.Second
-	streamChunkSize   = 256
+	protocolMagic      = uint16(0x39C5)
+	maxMessageSize     = uint32(10 * 1024 * 1024)
+	readBufferSize     = 4096
+	streamChanSize     = 256
+	connectTimeout     = 10 * time.Second
+	proxyTimeout       = 30 * time.Second
+	dialTimeout        = 10 * time.Second
+	streamChunkSize    = 256
 	streamChunkTimeout = 300 * time.Second
+	maxRetries         = 5
+	sendBufSize        = 2048
 )
 
-// Go HTTP 自动管理响应头 — 不应从原始响应复制
+var errBadCRC = errors.New("bad CRC")
+
 var autoManagedHeaders = map[string]bool{
 	"content-length":   true,
 	"transfer-encoding": true,
@@ -74,6 +80,14 @@ type Message struct {
 	Type     MsgType
 	StreamID uint32
 	Data     []byte
+}
+
+type sendBufEntry struct {
+	seqNum   uint32
+	streamID uint32
+	rawFrame []byte
+	retries  int
+	used     bool
 }
 
 // ---------------------------------------------------------------------------
@@ -102,27 +116,38 @@ func decompress(data []byte) ([]byte, error) {
 }
 
 // ---------------------------------------------------------------------------
-// 协议读写（含帧同步）
+// 协议读写（含帧同步 / CRC32 / 重传）
 // ---------------------------------------------------------------------------
 
-func writeMessage(w io.Writer, msg Message) error {
+func (sm *SerialMultiplexer) writeMessage(w io.Writer, msg Message) error {
 	length := uint32(len(msg.Data))
 	if length > maxMessageSize {
 		return fmt.Errorf("message too large: %d", length)
 	}
-	// 一次性组装完整帧后写入，避免串口驱动分帧
-	buf := make([]byte, 11+length)
+
+	seqNum := atomic.AddUint32(&sm.sendSeq, 1) - 1
+
+	headerSize := 15
+	crc := crc32.ChecksumIEEE(msg.Data)
+	totalLen := headerSize + int(length) + 4
+	buf := make([]byte, totalLen)
 	binary.BigEndian.PutUint16(buf[0:2], protocolMagic)
 	buf[2] = byte(msg.Type)
 	binary.BigEndian.PutUint32(buf[3:7], msg.StreamID)
 	binary.BigEndian.PutUint32(buf[7:11], length)
-	copy(buf[11:], msg.Data)
+	binary.BigEndian.PutUint32(buf[11:15], seqNum)
+	copy(buf[15:], msg.Data)
+	binary.BigEndian.PutUint32(buf[15+length:], crc)
+
+	sm.storeSendBuf(seqNum, msg.StreamID, buf)
+
 	_, err := w.Write(buf)
 	return err
 }
 
+// readMessage 读取完整消息（对外兼容，不处理重传逻辑）
 func readMessage(r io.Reader) (Message, error) {
-	header := make([]byte, 11)
+	header := make([]byte, 15)
 	if _, err := io.ReadFull(r, header); err != nil {
 		return Message{}, err
 	}
@@ -130,21 +155,7 @@ func readMessage(r io.Reader) (Message, error) {
 	if magic != protocolMagic {
 		return Message{}, fmt.Errorf("invalid magic: 0x%04X", magic)
 	}
-	msg := Message{
-		Type:     MsgType(header[2]),
-		StreamID: binary.BigEndian.Uint32(header[3:7]),
-	}
-	length := binary.BigEndian.Uint32(header[7:11])
-	if length > maxMessageSize {
-		return Message{}, fmt.Errorf("message too large: %d", length)
-	}
-	if length > 0 {
-		msg.Data = make([]byte, length)
-		if _, err := io.ReadFull(r, msg.Data); err != nil {
-			return Message{}, err
-		}
-	}
-	return msg, nil
+	return parseMessageBody(r, header)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,24 +163,33 @@ func readMessage(r io.Reader) (Message, error) {
 // ---------------------------------------------------------------------------
 
 type SerialMultiplexer struct {
-	conn      io.ReadWriteCloser
-	writeMu   sync.Mutex
-	streams   map[uint32]chan Message
-	streamsMu sync.RWMutex
-	nextID    uint32
-	isClient  bool
+	conn       io.ReadWriteCloser
+	writeMu    sync.Mutex
+	streams    map[uint32]chan Message
+	streamsMu  sync.RWMutex
+	nextID     uint32
+	isClient   bool
+	httpsHosts sync.Map
+
+	sendSeq      uint32
+	sendBuf      []sendBufEntry
+	sendBufMu    sync.Mutex
+	processedSeq map[uint32]bool
+	processedMu  sync.Mutex
 }
 
 func NewSerialMultiplexer(conn io.ReadWriteCloser, isClient bool) *SerialMultiplexer {
 	sm := &SerialMultiplexer{
-		conn:     conn,
-		streams:  make(map[uint32]chan Message),
-		isClient: isClient,
+		conn:         conn,
+		streams:      make(map[uint32]chan Message),
+		isClient:     isClient,
+		sendBuf:      make([]sendBufEntry, sendBufSize),
+		processedSeq: make(map[uint32]bool),
 	}
 	if isClient {
-		sm.nextID = 1 // Client 使用奇数 ID
+		sm.nextID = 1
 	} else {
-		sm.nextID = ^uint32(0) // Server 不应主动分配 ID，设为无效值
+		sm.nextID = ^uint32(0)
 	}
 	go sm.readLoop()
 	return sm
@@ -182,7 +202,6 @@ func (sm *SerialMultiplexer) AllocStreamID() uint32 {
 	return atomic.AddUint32(&sm.nextID, 2) - 2
 }
 
-// OpenStream 创建流 channel。若 ID 已存在则返回 false，防止覆盖
 func (sm *SerialMultiplexer) OpenStream(id uint32) (chan Message, bool) {
 	ch := make(chan Message, streamChanSize)
 	sm.streamsMu.Lock()
@@ -203,11 +222,11 @@ func (sm *SerialMultiplexer) CloseStream(id uint32) {
 func (sm *SerialMultiplexer) Send(msg Message) error {
 	sm.writeMu.Lock()
 	defer sm.writeMu.Unlock()
-	return writeMessage(sm.conn, msg)
+	return sm.writeMessage(sm.conn, msg)
 }
 
 // ---------------------------------------------------------------------------
-// 读取循环 + 帧同步
+// 读取循环 + 帧同步 + CRC 校验 + 重传请求
 // ---------------------------------------------------------------------------
 
 func (sm *SerialMultiplexer) readLoop() {
@@ -219,66 +238,106 @@ func (sm *SerialMultiplexer) readLoop() {
 				return
 			}
 			log.Printf("Read message error: %v", err)
-			// 帧同步会处理 magic 不匹配的情况，其他致命错误继续尝试
 			continue
 		}
 		sm.dispatch(msg)
 	}
 }
 
-// readMessageSync 读取一条消息，若帧错位自动进行帧同步
 func (sm *SerialMultiplexer) readMessageSync() (Message, error) {
-	header := make([]byte, 11)
-	if _, err := io.ReadFull(sm.conn, header); err != nil {
-		return Message{}, err
+	for {
+		header := make([]byte, 15)
+		if _, err := io.ReadFull(sm.conn, header); err != nil {
+			return Message{}, err
+		}
+		magic := binary.BigEndian.Uint16(header[0:2])
+		if magic != protocolMagic {
+			return sm.resync(header)
+		}
+
+		msgType := MsgType(header[2])
+		streamID := binary.BigEndian.Uint32(header[3:7])
+		length := binary.BigEndian.Uint32(header[7:11])
+		seqNum := binary.BigEndian.Uint32(header[11:15])
+
+		if length > maxMessageSize {
+			continue
+		}
+
+		var data []byte
+		if length > 0 {
+			data = make([]byte, length)
+			if _, err := io.ReadFull(sm.conn, data); err != nil {
+				return Message{}, err
+			}
+		}
+
+		crcBytes := make([]byte, 4)
+		if _, err := io.ReadFull(sm.conn, crcBytes); err != nil {
+			return Message{}, err
+		}
+
+		expectedCRC := binary.BigEndian.Uint32(crcBytes)
+		actualCRC := crc32.ChecksumIEEE(data)
+		if expectedCRC != actualCRC {
+			if streamID != 0 {
+				sm.requestRetransmit(seqNum)
+			}
+			log.Printf("Bad CRC: seq=%d stream=%d type=%d len=%d, requesting retransmit", seqNum, streamID, msgType, length)
+			continue
+		}
+
+		if sm.isProcessed(seqNum) {
+			continue
+		}
+		sm.markProcessed(seqNum)
+
+		return Message{Type: msgType, StreamID: streamID, Data: data}, nil
 	}
-	magic := binary.BigEndian.Uint16(header[0:2])
-	if magic != protocolMagic {
-		return sm.resync(header)
-	}
-	return parseMessageBody(sm.conn, header)
 }
 
-// resync 在已读数据中寻找合法的帧头，恢复帧同步
 func (sm *SerialMultiplexer) resync(partial []byte) (Message, error) {
 	log.Println("Frame desync detected, entering resync mode...")
 
-	window := make([]byte, 0, 22)
+	window := make([]byte, 0, 30)
 	for _, b := range partial {
 		window = append(window, b)
-		if m := checkWindow(window); m != nil {
-			log.Println("Frame sync recovered")
-			candidate := window[len(window)-11:]
-			return parseMessageBody(sm.conn, candidate)
+		if header := checkWindow(window); header != nil {
+			msg, err := parseMessageBody(sm.conn, header)
+			if err == nil {
+				log.Println("Frame sync recovered")
+				return msg, nil
+			}
 		}
 	}
 
 	buf := make([]byte, 1)
-	scanLimit := int(maxMessageSize) + 22
+	scanLimit := int(maxMessageSize) + 30
 	for scanned := 0; scanned < scanLimit; scanned++ {
 		_, err := io.ReadFull(sm.conn, buf)
 		if err != nil {
 			return Message{}, fmt.Errorf("resync failed: %w", err)
 		}
 		window = append(window, buf[0])
-		if len(window) > 22 {
+		if len(window) > 30 {
 			window = window[1:]
 		}
-		if m := checkWindow(window); m != nil {
-			log.Println("Frame sync recovered")
-			candidate := window[len(window)-11:]
-			return parseMessageBody(sm.conn, candidate)
+		if header := checkWindow(window); header != nil {
+			msg, err := parseMessageBody(sm.conn, header)
+			if err == nil {
+				log.Println("Frame sync recovered")
+				return msg, nil
+			}
 		}
 	}
 	return Message{}, fmt.Errorf("resync exceeded scan limit (%d bytes)", scanLimit)
 }
 
-// checkWindow 检查滑动窗口末尾是否存在合法帧头
-func checkWindow(window []byte) *Message {
-	if len(window) < 11 {
+func checkWindow(window []byte) []byte {
+	if len(window) < 15 {
 		return nil
 	}
-	candidate := window[len(window)-11:]
+	candidate := window[len(window)-15:]
 	if binary.BigEndian.Uint16(candidate[0:2]) != protocolMagic {
 		return nil
 	}
@@ -286,11 +345,7 @@ func checkWindow(window []byte) *Message {
 	if length > maxMessageSize {
 		return nil
 	}
-	msg := Message{
-		Type:     MsgType(candidate[2]),
-		StreamID: binary.BigEndian.Uint32(candidate[3:7]),
-	}
-	return &msg
+	return candidate
 }
 
 func parseMessageBody(r io.Reader, header []byte) (Message, error) {
@@ -308,7 +363,61 @@ func parseMessageBody(r io.Reader, header []byte) (Message, error) {
 			return Message{}, err
 		}
 	}
+	crcBytes := make([]byte, 4)
+	if _, err := io.ReadFull(r, crcBytes); err != nil {
+		return Message{}, err
+	}
+	expectedCRC := binary.BigEndian.Uint32(crcBytes)
+	actualCRC := crc32.ChecksumIEEE(msg.Data)
+	if expectedCRC != actualCRC {
+		return Message{}, errBadCRC
+	}
 	return msg, nil
+}
+
+// ---------------------------------------------------------------------------
+// 发送缓冲区
+// ---------------------------------------------------------------------------
+
+func (sm *SerialMultiplexer) storeSendBuf(seqNum uint32, streamID uint32, frame []byte) {
+	sm.sendBufMu.Lock()
+	defer sm.sendBufMu.Unlock()
+	idx := seqNum % sendBufSize
+	sm.sendBuf[idx] = sendBufEntry{
+		seqNum:   seqNum,
+		streamID: streamID,
+		rawFrame: frame,
+		retries:  0,
+		used:     true,
+	}
+}
+
+func (sm *SerialMultiplexer) requestRetransmit(seqNum uint32) {
+	data := make([]byte, 4)
+	binary.BigEndian.PutUint32(data, seqNum)
+	if err := sm.Send(Message{Type: MsgRetransmit, StreamID: 0, Data: data}); err != nil {
+		log.Printf("Failed to send retransmit request for seq=%d: %v", seqNum, err)
+	}
+}
+
+func (sm *SerialMultiplexer) isProcessed(seqNum uint32) bool {
+	sm.processedMu.Lock()
+	defer sm.processedMu.Unlock()
+	return sm.processedSeq[seqNum]
+}
+
+func (sm *SerialMultiplexer) markProcessed(seqNum uint32) {
+	sm.processedMu.Lock()
+	defer sm.processedMu.Unlock()
+	sm.processedSeq[seqNum] = true
+	if len(sm.processedSeq) > sendBufSize*2 {
+		threshold := seqNum - sendBufSize
+		for k := range sm.processedSeq {
+			if k < threshold {
+				delete(sm.processedSeq, k)
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +425,11 @@ func parseMessageBody(r io.Reader, header []byte) (Message, error) {
 // ---------------------------------------------------------------------------
 
 func (sm *SerialMultiplexer) dispatch(msg Message) {
+	if msg.Type == MsgRetransmit {
+		sm.handleMsgRetransmit(msg)
+		return
+	}
+
 	sm.streamsMu.RLock()
 	ch, ok := sm.streams[msg.StreamID]
 	sm.streamsMu.RUnlock()
@@ -329,7 +443,6 @@ func (sm *SerialMultiplexer) dispatch(msg Message) {
 		return
 	}
 
-	// Server 端为新请求创建流
 	if !sm.isClient && (msg.Type == MsgTransparent || msg.Type == MsgConnect) {
 		ch, ok := sm.OpenStream(msg.StreamID)
 		if !ok {
@@ -340,6 +453,40 @@ func (sm *SerialMultiplexer) dispatch(msg Message) {
 	} else {
 		log.Printf("Unexpected message: stream=%d type=%d", msg.StreamID, msg.Type)
 	}
+}
+
+func (sm *SerialMultiplexer) handleMsgRetransmit(msg Message) {
+	if len(msg.Data) < 4 {
+		return
+	}
+	seqNum := binary.BigEndian.Uint32(msg.Data)
+
+	sm.sendBufMu.Lock()
+	idx := seqNum % sendBufSize
+	entry := &sm.sendBuf[idx]
+	if !entry.used || entry.seqNum != seqNum {
+		sm.sendBufMu.Unlock()
+		return
+	}
+
+	if entry.retries >= maxRetries {
+		streamID := entry.streamID
+		entry.used = false
+		sm.sendBufMu.Unlock()
+		log.Printf("[RETRANSMIT] seq=%d stream=%d max retries exceeded, abandoning", seqNum, streamID)
+		sm.sendError(streamID, "max retries exceeded")
+		return
+	}
+
+	entry.retries++
+	frameCopy := make([]byte, len(entry.rawFrame))
+	copy(frameCopy, entry.rawFrame)
+	sm.sendBufMu.Unlock()
+
+	log.Printf("[RETRANSMIT] Resending seq=%d stream=%d retry=%d/%d", seqNum, entry.streamID, entry.retries, maxRetries)
+	sm.writeMu.Lock()
+	sm.conn.Write(frameCopy)
+	sm.writeMu.Unlock()
 }
 
 func (sm *SerialMultiplexer) handleServerRequest(msg Message, ch chan Message) {
@@ -373,13 +520,11 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 		return
 	}
 
-	// [FIX] 清空 RequestURI，http.Client.Do 禁止发送带 RequestURI 的请求
 	req.RequestURI = ""
 
 	log.Printf("[SERVER-TRANSPARENT] stream=%d parsed: method=%s url=%s scheme=%s host=%s requestURI=%s",
 		msg.StreamID, req.Method, req.URL.String(), req.URL.Scheme, req.URL.Host, req.RequestURI)
 
-	// 确保 URL 完整（某些请求可能是相对路径）
 	if req.URL.Scheme == "" {
 		req.URL.Scheme = "http"
 	}
@@ -387,8 +532,20 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 		req.URL.Host = req.Host
 	}
 
+	hostKey := req.URL.Host
+	if knownScheme, ok := sm.httpsHosts.Load(hostKey); ok && knownScheme.(string) == "https" {
+		req.URL.Scheme = "https"
+	}
+
 	log.Printf("[SERVER-TRANSPARENT] stream=%d after fixup: scheme=%s url=%s -> making request",
 		msg.StreamID, req.URL.Scheme, req.URL.String())
+
+	var bodyBytes []byte
+	if req.Body != nil {
+		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+	}
+	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
 	var cancelled atomic.Bool
 	ctx, cancel := context.WithCancel(context.Background())
@@ -435,6 +592,25 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 		sm.sendError(msg.StreamID, err.Error())
 		return
 	}
+
+	if isHTTPToHTTPSRedirect(resp) {
+		resp.Body.Close()
+		sm.httpsHosts.Store(hostKey, "https")
+		log.Printf("[SERVER-TRANSPARENT] stream=%d host=%s redirected to HTTPS, retrying", msg.StreamID, hostKey)
+
+		retryReq := req.Clone(ctx)
+		retryReq.URL.Scheme = "https"
+		retryReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+		resp2, err := client.Do(retryReq)
+		if err != nil {
+			log.Printf("Proxy HTTPS retry error: %v", err)
+			sm.sendError(msg.StreamID, err.Error())
+			return
+		}
+		resp = resp2
+	}
+
 	defer resp.Body.Close()
 	log.Printf("[SERVER-TRANSPARENT] stream=%d response: status=%d", msg.StreamID, resp.StatusCode)
 
@@ -502,6 +678,24 @@ func isStreamResponse(resp *http.Response) bool {
 	return strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 }
 
+func isHTTPToHTTPSRedirect(resp *http.Response) bool {
+	if resp.StatusCode < 300 || resp.StatusCode > 399 {
+		return false
+	}
+	location := resp.Header.Get("Location")
+	if location == "" {
+		return false
+	}
+	if !strings.Contains(location, "https") {
+		return false
+	}
+	u, err := url.Parse(location)
+	if err != nil || u.Scheme != "https" {
+		return false
+	}
+	return true
+}
+
 func dumpResponseHeaders(resp *http.Response) []byte {
 	var buf bytes.Buffer
 	buf.WriteString(resp.Proto)
@@ -520,13 +714,11 @@ func dumpResponseHeaders(resp *http.Response) []byte {
 	return buf.Bytes()
 }
 
-// sendError 封装错误发送并检查返回值
 func (sm *SerialMultiplexer) sendError(streamID uint32, text string) {
 	if err := sm.Send(Message{Type: MsgError, StreamID: streamID, Data: []byte(text)}); err != nil {
 		log.Printf("Send error message failed: %v", err)
 	}
 }
-
 
 // ---------------------------------------------------------------------------
 // Server: CONNECT 处理
@@ -540,7 +732,6 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 		return
 	}
 
-	// 带超时的 TCP 连接
 	conn, err := net.DialTimeout("tcp", host, connectTimeout)
 	if err != nil {
 		sm.sendError(msg.StreamID, err.Error())
@@ -561,7 +752,6 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 	var doneOnce sync.Once
 	closeDone := func() { doneOnce.Do(func() { close(done) }) }
 
-	// remote -> serial
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, readBufferSize)
@@ -587,7 +777,6 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 		}
 	}()
 
-	// serial -> remote
 	go func() {
 		defer wg.Done()
 		for {
@@ -659,7 +848,6 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// 注意: 不在此处 defer close，因为转发 goroutine 会管理连接生命周期
 
 	streamID := p.mux.AllocStreamID()
 	ch, ok := p.mux.OpenStream(streamID)
@@ -677,7 +865,6 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// 等待 server 响应（带超时保护）
 	var respMsg Message
 	select {
 	case respMsg = <-ch:
@@ -710,7 +897,6 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	var doneOnce sync.Once
 	closeDone := func() { doneOnce.Do(func() { close(done) }) }
 
-	// browser -> serial
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, readBufferSize)
@@ -733,7 +919,6 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	// serial -> browser
 	go func() {
 		defer wg.Done()
 		for {
@@ -777,8 +962,6 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 type transparentProxy struct {
 	mux *SerialMultiplexer
 }
-
-// Client: 反向代理 — 将请求重写目标后走透明代理通道
 
 type reverseProxy struct {
 	mux      *SerialMultiplexer
@@ -841,7 +1024,6 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// 等待响应（带超时）
 	var msg Message
 	select {
 	case msg = <-ch:
@@ -970,7 +1152,6 @@ func parseFlags() *Config {
 	return cfg
 }
 
-// 完整串口配置
 func openSerial(device string, baud int) (*serial.Port, error) {
 	c := &serial.Config{
 		Name:     device,
@@ -995,7 +1176,8 @@ func main() {
 
 	log.Printf("Starting as %s", cfg.Role)
 	log.Printf("Serial: %s @ %d baud", cfg.SerialDevice, cfg.BaudRate)
-	log.Printf("Protocol: magic=0x%04X, header=11 bytes", protocolMagic)
+	log.Printf("Protocol: magic=0x%04X, header=15 bytes, CRC32", protocolMagic)
+	log.Printf("Retransmit: maxRetries=%d, sendBuf=%d entries", maxRetries, sendBufSize)
 	log.Printf("Proxy listen: %s (CONNECT + transparent)", cfg.ProxyListen)
 
 	serialConn, err := openSerial(cfg.SerialDevice, cfg.BaudRate)
@@ -1006,7 +1188,6 @@ func main() {
 
 	mux := NewSerialMultiplexer(serialConn, cfg.Role == "client")
 
-	// Context 控制优雅关闭
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1015,7 +1196,7 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("Shutting down gracefully...")
-		serialConn.Close() // 触发 readLoop EOF 退出
+		serialConn.Close()
 		cancel()
 	}()
 
@@ -1035,7 +1216,6 @@ func runClient(ctx context.Context, cfg *Config, mux *SerialMultiplexer) {
 
 	var wg sync.WaitGroup
 
-	// 统一代理端口 (CONNECT + 透明)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -1053,7 +1233,6 @@ func runClient(ctx context.Context, cfg *Config, mux *SerialMultiplexer) {
 		}
 	}()
 
-	// 反向代理端口
 	if cfg.ReverseListen != "" && cfg.ReverseUpstream != "" {
 		upstreamURL, err := url.Parse(cfg.ReverseUpstream)
 		if err != nil {
