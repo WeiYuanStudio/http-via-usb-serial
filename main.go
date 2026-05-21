@@ -1,22 +1,5 @@
 package main
 
-// 修复汇总:
-// 1. [CRIT] sync.Once 保护 done channel — 防止双 goroutine 重复 close panic
-// 2. [CRIT] 帧同步机制 (Magic Number) — 串口半包读取后自动恢复
-// 3. [CRIT] 网络操作超时控制 — 防止永久阻塞
-// 4. [HIGH] OpenStream 返回 bool — 防止重复 ID 覆盖
-// 5. [HIGH] 所有 sm.Send 错误路径检查返回值
-// 6. [HIGH] 透明代理验证消息类型
-// 7. [MED]  writeMessage 一次性组装 buffer
-// 8. [MED]  信号处理改为优雅关闭
-// 9. [MED]  serial->remote goroutine 所有返回路径关闭 done
-// 10. [MED] 透明代理响应 Header 过滤自动管理头
-// 11. [LOW]  maxMessageSize 统一为 uint32
-// 12. [LOW]  转发阶段处理 MsgError
-// 13. [LOW]  完整串口配置参数
-// 14. [LOW]  所有 Send 调用检查错误
-// 15. [LOW]  context 控制生命周期
-
 import (
 	"bufio"
 	"bytes"
@@ -127,7 +110,7 @@ func writeMessage(w io.Writer, msg Message) error {
 	if length > maxMessageSize {
 		return fmt.Errorf("message too large: %d", length)
 	}
-	// 一次性组装完整帧后写入，避免串口驱动分帧 [MED#7]
+	// 一次性组装完整帧后写入，避免串口驱动分帧
 	buf := make([]byte, 11+length)
 	binary.BigEndian.PutUint16(buf[0:2], protocolMagic)
 	buf[2] = byte(msg.Type)
@@ -186,7 +169,7 @@ func NewSerialMultiplexer(conn io.ReadWriteCloser, isClient bool) *SerialMultipl
 	if isClient {
 		sm.nextID = 1 // Client 使用奇数 ID
 	} else {
-		sm.nextID = ^uint32(0) // Server 不应主动分配 ID，设为无效值 [LOW#11]
+		sm.nextID = ^uint32(0) // Server 不应主动分配 ID，设为无效值
 	}
 	go sm.readLoop()
 	return sm
@@ -199,7 +182,7 @@ func (sm *SerialMultiplexer) AllocStreamID() uint32 {
 	return atomic.AddUint32(&sm.nextID, 2) - 2
 }
 
-// OpenStream 创建流 channel。若 ID 已存在则返回 false，防止覆盖 [HIGH#4]
+// OpenStream 创建流 channel。若 ID 已存在则返回 false，防止覆盖
 func (sm *SerialMultiplexer) OpenStream(id uint32) (chan Message, bool) {
 	ch := make(chan Message, streamChanSize)
 	sm.streamsMu.Lock()
@@ -224,7 +207,7 @@ func (sm *SerialMultiplexer) Send(msg Message) error {
 }
 
 // ---------------------------------------------------------------------------
-// 读取循环 + 帧同步 [CRIT#2]
+// 读取循环 + 帧同步
 // ---------------------------------------------------------------------------
 
 func (sm *SerialMultiplexer) readLoop() {
@@ -264,7 +247,9 @@ func (sm *SerialMultiplexer) resync(partial []byte) (Message, error) {
 	for _, b := range partial {
 		window = append(window, b)
 		if m := checkWindow(window); m != nil {
-			return *m, nil
+			log.Println("Frame sync recovered")
+			candidate := window[len(window)-11:]
+			return parseMessageBody(sm.conn, candidate)
 		}
 	}
 
@@ -281,7 +266,8 @@ func (sm *SerialMultiplexer) resync(partial []byte) (Message, error) {
 		}
 		if m := checkWindow(window); m != nil {
 			log.Println("Frame sync recovered")
-			return *m, nil
+			candidate := window[len(window)-11:]
+			return parseMessageBody(sm.conn, candidate)
 		}
 	}
 	return Message{}, fmt.Errorf("resync exceeded scan limit (%d bytes)", scanLimit)
@@ -343,7 +329,7 @@ func (sm *SerialMultiplexer) dispatch(msg Message) {
 		return
 	}
 
-	// Server 端为新请求创建流 [HIGH#4: 检查 OpenStream 返回值]
+	// Server 端为新请求创建流
 	if !sm.isClient && (msg.Type == MsgTransparent || msg.Type == MsgConnect) {
 		ch, ok := sm.OpenStream(msg.StreamID)
 		if !ok {
@@ -366,7 +352,7 @@ func (sm *SerialMultiplexer) handleServerRequest(msg Message, ch chan Message) {
 }
 
 // ---------------------------------------------------------------------------
-// Server: 透明代理处理 [CRIT#3, HIGH#5]
+// Server: 透明代理处理
 // ---------------------------------------------------------------------------
 
 func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
@@ -503,7 +489,7 @@ func dumpResponseHeaders(resp *http.Response) []byte {
 	return buf.Bytes()
 }
 
-// sendError 封装错误发送并检查返回值 [HIGH#5]
+// sendError 封装错误发送并检查返回值
 func (sm *SerialMultiplexer) sendError(streamID uint32, text string) {
 	if err := sm.Send(Message{Type: MsgError, StreamID: streamID, Data: []byte(text)}); err != nil {
 		log.Printf("Send error message failed: %v", err)
@@ -512,7 +498,7 @@ func (sm *SerialMultiplexer) sendError(streamID uint32, text string) {
 
 
 // ---------------------------------------------------------------------------
-// Server: CONNECT 处理 [CRIT#1, CRIT#3, MED#9]
+// Server: CONNECT 处理
 // ---------------------------------------------------------------------------
 
 func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
@@ -523,7 +509,7 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 		return
 	}
 
-	// 带超时的 TCP 连接 [CRIT#3]
+	// 带超时的 TCP 连接
 	conn, err := net.DialTimeout("tcp", host, connectTimeout)
 	if err != nil {
 		sm.sendError(msg.StreamID, err.Error())
@@ -542,7 +528,7 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 	wg.Add(2)
 	done := make(chan struct{})
 	var doneOnce sync.Once
-	closeDone := func() { doneOnce.Do(func() { close(done) }) } // [CRIT#1]
+	closeDone := func() { doneOnce.Do(func() { close(done) }) }
 
 	// remote -> serial
 	go func() {
@@ -570,7 +556,7 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 		}
 	}()
 
-	// serial -> remote [MED#9: 所有返回路径关闭 done]
+	// serial -> remote
 	go func() {
 		defer wg.Done()
 		for {
@@ -588,7 +574,7 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 					closeDone()
 					conn.Close()
 					return
-				case MsgError: // [LOW#12]
+				case MsgError:
 					log.Printf("Received error for stream %d: %s", msg.StreamID, string(m.Data))
 					closeDone()
 					conn.Close()
@@ -609,7 +595,7 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 }
 
 // ---------------------------------------------------------------------------
-// Client: CONNECT 代理 [CRIT#1, HIGH#6]
+// Client: CONNECT 代理
 // ---------------------------------------------------------------------------
 
 type connectProxy struct {
@@ -691,7 +677,7 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	wg.Add(2)
 	done := make(chan struct{})
 	var doneOnce sync.Once
-	closeDone := func() { doneOnce.Do(func() { close(done) }) } // [CRIT#1]
+	closeDone := func() { doneOnce.Do(func() { close(done) }) }
 
 	// browser -> serial
 	go func() {
@@ -716,7 +702,7 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	// serial -> browser [LOW#12: 处理 MsgError]
+	// serial -> browser
 	go func() {
 		defer wg.Done()
 		for {
@@ -754,7 +740,7 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Client: 透明代理 [HIGH#6, MED#10]
+// Client: 透明代理
 // ---------------------------------------------------------------------------
 
 type transparentProxy struct {
@@ -952,7 +938,7 @@ func parseFlags() *Config {
 	return cfg
 }
 
-// [LOW#13] 完整串口配置
+// 完整串口配置
 func openSerial(device string, baud int) (*serial.Port, error) {
 	c := &serial.Config{
 		Name:     device,
@@ -965,7 +951,7 @@ func openSerial(device string, baud int) (*serial.Port, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Main [MED#8: 优雅关闭]
+// Main
 // ---------------------------------------------------------------------------
 
 func main() {
@@ -988,7 +974,7 @@ func main() {
 
 	mux := NewSerialMultiplexer(serialConn, cfg.Role == "client")
 
-	// Context 控制优雅关闭 [MED#8]
+	// Context 控制优雅关闭
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
