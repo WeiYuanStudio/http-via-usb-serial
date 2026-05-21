@@ -37,20 +37,20 @@ type Config struct {
 type MsgType byte
 
 const (
-	MsgTransparent      MsgType = 0x01
-	MsgResponse         MsgType = 0x02
-	MsgConnect          MsgType = 0x03
-	MsgConnectOK        MsgType = 0x04
-	MsgData             MsgType = 0x05
-	MsgClose            MsgType = 0x06
-	MsgError            MsgType = 0x07
-	MsgResponseHeaders  MsgType = 0x08
+	MsgTransparent     MsgType = 0x01 // 透明代理 HTTP 请求 (Client → Server)
+	MsgResponse        MsgType = 0x02 // 透明代理 HTTP 响应 (Server → Client)
+	MsgConnect         MsgType = 0x03 // CONNECT 打开请求, data=host:port (Client → Server)
+	MsgConnectOK       MsgType = 0x04 // CONNECT 建立成功 (Server → Client)
+	MsgData            MsgType = 0x05 // TCP 流数据 (双向)
+	MsgClose           MsgType = 0x06 // 流关闭通知 (双向)
+	MsgError           MsgType = 0x07 // 错误响应 (Server → Client)
+	MsgResponseHeaders MsgType = 0x08 // 流式响应头 (Server → Client)
 )
 
 // 协议帧格式: [2字节Magic][1字节Type][4字节StreamID][4字节Length][Data]
 // 帧同步魔数 — 用于检测和恢复帧边界
 const (
-	protocolMagic     = uint16(0xAA55)
+	protocolMagic     = uint16(0x39C5)
 	maxMessageSize    = uint32(10 * 1024 * 1024)
 	readBufferSize    = 4096
 	streamChanSize    = 256
@@ -390,6 +390,33 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	log.Printf("[SERVER-TRANSPARENT] stream=%d after fixup: scheme=%s url=%s -> making request",
 		msg.StreamID, req.URL.Scheme, req.URL.String())
 
+	var cancelled atomic.Bool
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	streamDone := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case m, ok := <-ch:
+				if !ok {
+					return
+				}
+				if m.Type == MsgClose {
+					log.Printf("[SERVER] stream=%d client disconnected, cancelling request", msg.StreamID)
+					cancelled.Store(true)
+					cancel()
+					return
+				}
+			case <-streamDone:
+				return
+			}
+		}
+	}()
+	defer close(streamDone)
+
+	req = req.WithContext(ctx)
+
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: (&net.Dialer{
@@ -412,7 +439,7 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	log.Printf("[SERVER-TRANSPARENT] stream=%d response: status=%d", msg.StreamID, resp.StatusCode)
 
 	if isStreamResponse(resp) {
-		sm.handleTransparentStream(msg.StreamID, resp)
+		sm.handleTransparentStream(msg.StreamID, resp, &cancelled)
 	} else {
 		respData, err := httputil.DumpResponse(resp, true)
 		if err != nil {
@@ -434,7 +461,7 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	}
 }
 
-func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http.Response) {
+func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http.Response, cancelled *atomic.Bool) {
 	headers := dumpResponseHeaders(resp)
 	compressed, err := compress(headers)
 	if err != nil {
@@ -457,6 +484,10 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 			}
 		}
 		if err != nil {
+			if cancelled.Load() {
+				log.Printf("[SERVER] stream=%d cancelled by client", streamID)
+				return
+			}
 			if err != io.EOF {
 				log.Printf("Read stream body error: %v", err)
 				sm.sendError(streamID, err.Error())
@@ -907,7 +938,8 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 		switch m.Type {
 		case MsgData:
 			if _, err := w.Write(m.Data); err != nil {
-				log.Printf("[TRANSPARENT] stream=%d write chunk error: %v", streamID, err)
+				log.Printf("[TRANSPARENT] stream=%d write chunk error, sending close to server: %v", streamID, err)
+				p.mux.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
 				return
 			}
 			flusher.Flush()

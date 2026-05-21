@@ -51,7 +51,7 @@ go build -o http-proxy main.go
 
 ## 通信协议
 
-- 消息格式: `[1字节类型][4字节流ID][4字节长度][数据]`
+- 消息格式: `[2字节Magic(0x39C5)][1字节类型][4字节流ID][4字节长度][数据]`
 - 流ID: Client 使用奇数 (1,3,5...)，用于多路复用多个并发连接
 - 数据压缩: 透明代理请求/响应用 gzip 压缩，CONNECT 流数据不压缩
 
@@ -66,6 +66,7 @@ go build -o http-proxy main.go
 | `MsgData` | `0x05` | TCP 流数据 | 双向 |
 | `MsgClose` | `0x06` | 流关闭通知 | 双向 |
 | `MsgError` | `0x07` | 错误响应 | Server → Client |
+| `MsgResponseHeaders` | `0x08` | 流式响应头（用于 SSE 流，随后用 MsgData 发送数据块） | Server → Client |
 
 ### 透明代理流程
 
