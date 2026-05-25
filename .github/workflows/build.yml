@@ -8,7 +8,16 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: http-proxy-linux-amd64
+          - os: windows-latest
+            name: http-proxy-windows-amd64.exe
+          - os: macos-latest
+            name: http-proxy-darwin-amd64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -18,11 +27,10 @@ jobs:
           go-version: '1.26'
 
       - name: Build
-        run: |
-          go build -ldflags "-s -w" -o http-proxy.exe main.go
+        run: go build -ldflags "-s -w" -o ${{ matrix.name }} main.go
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: http-proxy-windows-amd64
-          path: http-proxy.exe
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
