@@ -56,7 +56,7 @@ const (
 	protocolMagic      = uint16(0x39C5)
 	maxMessageSize     = uint32(10 * 1024 * 1024)
 	readBufferSize     = 4096
-	streamChanSize     = 256
+	streamChanSize     = 2048
 	connectTimeout     = 10 * time.Second
 	proxyTimeout       = 30 * time.Second
 	dialTimeout        = 10 * time.Second
@@ -429,11 +429,7 @@ func (sm *SerialMultiplexer) dispatch(msg Message) {
 	sm.streamsMu.RUnlock()
 
 	if ok {
-		select {
-		case ch <- msg:
-		default:
-			log.Printf("Stream %d buffer full, dropping message type %d", msg.StreamID, msg.Type)
-		}
+		ch <- msg
 		return
 	}
 
