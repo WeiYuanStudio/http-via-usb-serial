@@ -736,7 +736,7 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 		return
 	}
 
-	var clientAck uint32
+	clientAck := atomic.LoadUint32(&sm.sendSeq) - 1
 
 	buf := make([]byte, chunkSize)
 	for {
