@@ -81,6 +81,7 @@ var autoManagedHeaders = map[string]bool{
 type Message struct {
 	Type     MsgType
 	StreamID uint32
+	SeqNum   uint32
 	Data     []byte
 }
 
@@ -90,6 +91,48 @@ type sendBufEntry struct {
 	rawFrame []byte
 	retries  int
 	used     bool
+}
+
+type streamReorderBuf struct {
+	nextSeq uint32
+	started bool
+	pending map[uint32][]byte
+}
+
+func newStreamReorderBuf() *streamReorderBuf {
+	return &streamReorderBuf{pending: make(map[uint32][]byte)}
+}
+
+func (rb *streamReorderBuf) put(seqNum uint32, data []byte) [][]byte {
+	if seqNum < rb.nextSeq && rb.started {
+		return nil
+	}
+	if !rb.started {
+		rb.nextSeq = seqNum
+		rb.started = true
+	}
+	rb.pending[seqNum] = data
+	var result [][]byte
+	for {
+		d, ok := rb.pending[rb.nextSeq]
+		if !ok {
+			break
+		}
+		result = append(result, d)
+		delete(rb.pending, rb.nextSeq)
+		rb.nextSeq++
+	}
+	return result
+}
+
+func (rb *streamReorderBuf) writeTo(w io.Writer, seqNum uint32, data []byte) error {
+	chunks := rb.put(seqNum, data)
+	for _, chunk := range chunks {
+		if _, err := w.Write(chunk); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +349,7 @@ func (sm *SerialMultiplexer) readMessageSync() (Message, error) {
 			msg := Message{
 				Type:     MsgType(msgType),
 				StreamID: binary.BigEndian.Uint32(sm.scanBuf[searchPos+3 : searchPos+7]),
+				SeqNum:   seqNum,
 				Data:     make([]byte, length),
 			}
 			if length > 0 {
@@ -774,12 +818,13 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 
 	go func() {
 		defer wg.Done()
+		reorder := newStreamReorderBuf()
 		for {
 			select {
 			case m := <-ch:
 				switch m.Type {
 				case MsgData:
-					if _, err := conn.Write(m.Data); err != nil {
+					if err := reorder.writeTo(conn, m.SeqNum, m.Data); err != nil {
 						log.Printf("Write to remote failed: %v", err)
 						closeDone()
 						conn.Close()
@@ -916,12 +961,13 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	go func() {
 		defer wg.Done()
+		reorder := newStreamReorderBuf()
 		for {
 			select {
 			case m := <-ch:
 				switch m.Type {
 				case MsgData:
-					if _, err := clientConn.Write(m.Data); err != nil {
+					if err := reorder.writeTo(clientConn, m.SeqNum, m.Data); err != nil {
 						log.Printf("Write to browser failed: %v", err)
 						closeDone()
 						clientConn.Close()
@@ -1103,6 +1149,7 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 		return
 	}
 
+	reorder := newStreamReorderBuf()
 	for {
 		var m Message
 		select {
@@ -1114,12 +1161,15 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 
 		switch m.Type {
 		case MsgData:
-			if _, err := w.Write(m.Data); err != nil {
-				log.Printf("[TRANSPARENT] stream=%d write chunk error, sending close to server: %v", streamID, err)
-				p.mux.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
-				return
+			chunks := reorder.put(m.SeqNum, m.Data)
+			for _, chunk := range chunks {
+				if _, err := w.Write(chunk); err != nil {
+					log.Printf("[TRANSPARENT] stream=%d write chunk error, sending close to server: %v", streamID, err)
+					p.mux.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
+					return
+				}
+				flusher.Flush()
 			}
-			flusher.Flush()
 		case MsgClose:
 			return
 		case MsgError:
