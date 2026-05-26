@@ -48,6 +48,7 @@ const (
 	MsgError           MsgType = 0x07
 	MsgResponseHeaders MsgType = 0x08
 	MsgRetransmit      MsgType = 0x09
+	MsgAck             MsgType = 0x0A
 )
 
 // 帧格式: [2B Magic][1B Type][4B StreamID][4B Length][4B SeqNum][Data][4B CRC32]
@@ -66,6 +67,10 @@ const (
 	largeStreamChunkSize   = 4096
 	maxRetries             = 5
 	sendBufSize            = 2048
+	retransTimeout         = 5 * time.Second
+	maxRetransRequests     = 5
+	maxSendWindow          = 32
+	ackEveryNChunks        = 8
 )
 
 var errBadCRC = errors.New("bad CRC")
@@ -316,7 +321,7 @@ func (sm *SerialMultiplexer) readMessageSync() (Message, error) {
 				continue
 			}
 			msgType := sm.scanBuf[searchPos+2]
-			if msgType < 1 || msgType > 9 {
+			if msgType < 1 || msgType > byte(MsgAck) {
 				searchPos++
 				continue
 			}
@@ -605,6 +610,8 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	ackCh := make(chan uint32, 16)
+
 	streamDone := make(chan struct{})
 	go func() {
 		for {
@@ -613,11 +620,20 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 				if !ok {
 					return
 				}
-				if m.Type == MsgClose {
+				switch m.Type {
+				case MsgClose:
 					log.Printf("[SERVER] stream=%d client disconnected, cancelling request", msg.StreamID)
 					cancelled.Store(true)
 					cancel()
 					return
+				case MsgAck:
+					if len(m.Data) >= 4 {
+						ackSeq := binary.BigEndian.Uint32(m.Data[:4])
+						select {
+						case ackCh <- ackSeq:
+						default:
+						}
+					}
 				}
 			case <-streamDone:
 				return
@@ -670,9 +686,9 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 
 	contentLen := resp.ContentLength
 	if isStreamResponse(resp) {
-		sm.handleTransparentStream(msg.StreamID, resp, &cancelled, streamChunkSize)
+		sm.handleTransparentStream(msg.StreamID, resp, &cancelled, streamChunkSize, ackCh)
 	} else if contentLen > largeResponseThreshold || contentLen < 0 {
-		sm.handleTransparentStream(msg.StreamID, resp, &cancelled, largeStreamChunkSize)
+		sm.handleTransparentStream(msg.StreamID, resp, &cancelled, largeStreamChunkSize, ackCh)
 	} else {
 		respData, err := httputil.DumpResponse(resp, true)
 		if err != nil {
@@ -694,7 +710,20 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	}
 }
 
-func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http.Response, cancelled *atomic.Bool, chunkSize int) {
+func drainAck(ackCh <-chan uint32, clientAck *uint32) {
+	for {
+		select {
+		case ack := <-ackCh:
+			if ack > *clientAck {
+				*clientAck = ack
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http.Response, cancelled *atomic.Bool, chunkSize int, ackCh <-chan uint32) {
 	headers := dumpResponseHeaders(resp)
 	compressed, err := compress(headers)
 	if err != nil {
@@ -707,8 +736,28 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 		return
 	}
 
+	var clientAck uint32
+
 	buf := make([]byte, chunkSize)
 	for {
+		drainAck(ackCh, &clientAck)
+
+		sendSeq := atomic.LoadUint32(&sm.sendSeq)
+		if sendSeq-clientAck >= maxSendWindow {
+			select {
+			case ack := <-ackCh:
+				if ack > clientAck {
+					clientAck = ack
+				}
+			case <-time.After(500 * time.Millisecond):
+			}
+			if cancelled.Load() {
+				log.Printf("[SERVER] stream=%d cancelled by client", streamID)
+				return
+			}
+			continue
+		}
+
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if sendErr := sm.Send(Message{Type: MsgData, StreamID: streamID, Data: buf[:n]}); sendErr != nil {
@@ -1168,10 +1217,46 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 	}
 
 	reorder := newStreamReorderBuf()
+	var (
+		gapSeqNum    uint32
+		isWaiting    bool
+		retryCount   int
+		retransTimer <-chan time.Time
+		chunksSince  int
+		lastAckedSeq uint32
+	)
+
+	sendAck := func() {
+		ackSeq := reorder.nextSeq - 1
+		if !reorder.started {
+			return
+		}
+		if ackSeq <= lastAckedSeq {
+			return
+		}
+		ackData := make([]byte, 4)
+		binary.BigEndian.PutUint32(ackData, ackSeq)
+		if err := p.mux.Send(Message{Type: MsgAck, StreamID: streamID, Data: ackData}); err != nil {
+			return
+		}
+		lastAckedSeq = ackSeq
+		chunksSince = 0
+	}
+
 	for {
 		var m Message
 		select {
 		case m = <-ch:
+		case <-retransTimer:
+			retryCount++
+			if retryCount > maxRetransRequests {
+				log.Printf("[TRANSPARENT] stream=%d retransmit max retries for seq=%d, aborting", streamID, gapSeqNum)
+				return
+			}
+			log.Printf("[TRANSPARENT] stream=%d retransmit retry %d/%d for seq=%d", streamID, retryCount, maxRetransRequests, gapSeqNum)
+			p.mux.requestRetransmit(gapSeqNum)
+			retransTimer = time.After(retransTimeout)
+			continue
 		case <-time.After(streamChunkTimeout):
 			log.Printf("[TRANSPARENT] stream=%d chunk timeout", streamID)
 			return
@@ -1187,8 +1272,30 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 					return
 				}
 				flusher.Flush()
+				chunksSince++
 			}
+
+			if len(reorder.pending) > 0 {
+				gapSeq := reorder.nextSeq
+				if !isWaiting || gapSeqNum != gapSeq {
+					gapSeqNum = gapSeq
+					isWaiting = true
+					retryCount = 0
+					log.Printf("[TRANSPARENT] stream=%d gap detected at seq=%d, requesting retransmit", streamID, gapSeqNum)
+					p.mux.requestRetransmit(gapSeqNum)
+					retransTimer = time.After(retransTimeout)
+				}
+			} else {
+				isWaiting = false
+				retransTimer = nil
+			}
+
+			if chunksSince >= ackEveryNChunks {
+				sendAck()
+			}
+
 		case MsgClose:
+			sendAck()
 			return
 		case MsgError:
 			log.Printf("[TRANSPARENT] stream=%d received error: %s", streamID, string(m.Data))
