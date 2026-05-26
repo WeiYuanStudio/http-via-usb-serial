@@ -66,8 +66,6 @@ const (
 	largeResponseThreshold = 4 * 1024 * 1024
 	largeStreamChunkSize   = 4096
 	sendBufSize            = 2048
-	retransTimeout         = 5 * time.Second
-	maxRetransRequests     = 5
 	maxSendWindow          = 32
 	ackEveryNChunks        = 1
 )
@@ -115,6 +113,10 @@ func (rb *streamReorderBuf) put(seqNum uint32, data []byte) [][]byte {
 		rb.started = true
 	}
 	rb.pending[seqNum] = data
+	return rb.flush()
+}
+
+func (rb *streamReorderBuf) flush() [][]byte {
 	var result [][]byte
 	for {
 		d, ok := rb.pending[rb.nextSeq]
@@ -723,18 +725,18 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 		return
 	}
 
-	clientAck := atomic.LoadUint32(&sm.sendSeq) - 1
+	var clientChunkAck uint32
+	var chunkNum uint32
 
 	buf := make([]byte, chunkSize)
 	for {
-		drainAck(ackCh, &clientAck)
+		drainAck(ackCh, &clientChunkAck)
 
-		sendSeq := atomic.LoadUint32(&sm.sendSeq)
-		if sendSeq-clientAck >= maxSendWindow {
+		if chunkNum-clientChunkAck >= maxSendWindow {
 			select {
 			case ack := <-ackCh:
-				if ack > clientAck {
-					clientAck = ack
+				if ack > clientChunkAck {
+					clientChunkAck = ack
 				}
 			case <-time.After(500 * time.Millisecond):
 			}
@@ -747,7 +749,11 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			if sendErr := sm.Send(Message{Type: MsgData, StreamID: streamID, Data: buf[:n]}); sendErr != nil {
+			data := make([]byte, 4+n)
+			binary.BigEndian.PutUint32(data, chunkNum)
+			copy(data[4:], buf[:n])
+			chunkNum++
+			if sendErr := sm.Send(Message{Type: MsgData, StreamID: streamID, Data: data}); sendErr != nil {
 				log.Printf("Send stream data error: %v", sendErr)
 				return
 			}
@@ -1205,28 +1211,24 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 
 	reorder := newStreamReorderBuf()
 	var (
-		gapSeqNum    uint32
-		isWaiting    bool
-		retryCount   int
-		retransTimer <-chan time.Time
-		chunksSince  int
-		lastAckedSeq uint32
+		chunksSince     int
+		lastAckedChunk  uint32
 	)
 
 	sendAck := func() {
-		ackSeq := reorder.nextSeq - 1
+		ackChunk := reorder.nextSeq - 1
 		if !reorder.started {
 			return
 		}
-		if ackSeq <= lastAckedSeq {
+		if ackChunk <= lastAckedChunk {
 			return
 		}
 		ackData := make([]byte, 4)
-		binary.BigEndian.PutUint32(ackData, ackSeq)
+		binary.BigEndian.PutUint32(ackData, ackChunk)
 		if err := p.mux.Send(Message{Type: MsgAck, StreamID: streamID, Data: ackData}); err != nil {
 			return
 		}
-		lastAckedSeq = ackSeq
+		lastAckedChunk = ackChunk
 		chunksSince = 0
 	}
 
@@ -1234,16 +1236,6 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 		var m Message
 		select {
 		case m = <-ch:
-		case <-retransTimer:
-			retryCount++
-			if retryCount > maxRetransRequests {
-				log.Printf("[TRANSPARENT] stream=%d retransmit max retries for seq=%d, aborting", streamID, gapSeqNum)
-				return
-			}
-			log.Printf("[TRANSPARENT] stream=%d retransmit retry %d/%d for seq=%d", streamID, retryCount, maxRetransRequests, gapSeqNum)
-			p.mux.requestRetransmit(gapSeqNum)
-			retransTimer = time.After(retransTimeout)
-			continue
 		case <-time.After(streamChunkTimeout):
 			log.Printf("[TRANSPARENT] stream=%d chunk timeout", streamID)
 			return
@@ -1251,7 +1243,11 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 
 		switch m.Type {
 		case MsgData:
-			chunks := reorder.put(m.SeqNum, m.Data)
+			if len(m.Data) < 4 {
+				continue
+			}
+			chunkNum := binary.BigEndian.Uint32(m.Data[:4])
+			chunks := reorder.put(chunkNum, m.Data[4:])
 			for _, chunk := range chunks {
 				if _, err := w.Write(chunk); err != nil {
 					log.Printf("[TRANSPARENT] stream=%d write chunk error, sending close to server: %v", streamID, err)
@@ -1260,21 +1256,6 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 				}
 				flusher.Flush()
 				chunksSince++
-			}
-
-			if len(reorder.pending) > 0 {
-				gapSeq := reorder.nextSeq
-				if !isWaiting || gapSeqNum != gapSeq {
-					gapSeqNum = gapSeq
-					isWaiting = true
-					retryCount = 0
-					log.Printf("[TRANSPARENT] stream=%d gap detected at seq=%d, requesting retransmit", streamID, gapSeqNum)
-					p.mux.requestRetransmit(gapSeqNum)
-					retransTimer = time.After(retransTimeout)
-				}
-			} else {
-				isWaiting = false
-				retransTimer = nil
 			}
 
 			if chunksSince >= ackEveryNChunks {
