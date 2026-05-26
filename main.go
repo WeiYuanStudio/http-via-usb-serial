@@ -60,10 +60,12 @@ const (
 	connectTimeout     = 10 * time.Second
 	proxyTimeout       = 30 * time.Second
 	dialTimeout        = 10 * time.Second
-	streamChunkSize    = 256
-	streamChunkTimeout = 300 * time.Second
-	maxRetries         = 5
-	sendBufSize        = 2048
+	streamChunkSize        = 256
+	streamChunkTimeout     = 300 * time.Second
+	largeResponseThreshold = 4 * 1024 * 1024
+	largeStreamChunkSize   = 4096
+	maxRetries             = 5
+	sendBufSize            = 2048
 )
 
 var errBadCRC = errors.New("bad CRC")
@@ -608,8 +610,11 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	defer resp.Body.Close()
 	log.Printf("[SERVER-TRANSPARENT] stream=%d response: status=%d", msg.StreamID, resp.StatusCode)
 
+	contentLen := resp.ContentLength
 	if isStreamResponse(resp) {
-		sm.handleTransparentStream(msg.StreamID, resp, &cancelled)
+		sm.handleTransparentStream(msg.StreamID, resp, &cancelled, streamChunkSize)
+	} else if contentLen > largeResponseThreshold || contentLen < 0 {
+		sm.handleTransparentStream(msg.StreamID, resp, &cancelled, largeStreamChunkSize)
 	} else {
 		respData, err := httputil.DumpResponse(resp, true)
 		if err != nil {
@@ -631,7 +636,7 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	}
 }
 
-func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http.Response, cancelled *atomic.Bool) {
+func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http.Response, cancelled *atomic.Bool, chunkSize int) {
 	headers := dumpResponseHeaders(resp)
 	compressed, err := compress(headers)
 	if err != nil {
@@ -644,7 +649,7 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 		return
 	}
 
-	buf := make([]byte, streamChunkSize)
+	buf := make([]byte, chunkSize)
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
