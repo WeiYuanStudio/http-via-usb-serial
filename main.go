@@ -65,12 +65,11 @@ const (
 	streamChunkTimeout     = 300 * time.Second
 	largeResponseThreshold = 4 * 1024 * 1024
 	largeStreamChunkSize   = 4096
-	maxRetries             = 5
 	sendBufSize            = 2048
 	retransTimeout         = 5 * time.Second
 	maxRetransRequests     = 5
 	maxSendWindow          = 32
-	ackEveryNChunks        = 8
+	ackEveryNChunks        = 1
 )
 
 var errBadCRC = errors.New("bad CRC")
@@ -94,7 +93,6 @@ type sendBufEntry struct {
 	seqNum   uint32
 	streamID uint32
 	rawFrame []byte
-	retries  int
 	used     bool
 }
 
@@ -432,7 +430,6 @@ func (sm *SerialMultiplexer) storeSendBuf(seqNum uint32, streamID uint32, frame 
 		seqNum:   seqNum,
 		streamID: streamID,
 		rawFrame: frame,
-		retries:  0,
 		used:     true,
 	}
 	sm.pendingStreams[seqNum] = streamID
@@ -526,21 +523,11 @@ func (sm *SerialMultiplexer) handleMsgRetransmit(msg Message) {
 		return
 	}
 
-	if entry.retries >= maxRetries {
-		streamID := entry.streamID
-		entry.used = false
-		sm.sendBufMu.Unlock()
-		log.Printf("[RETRANSMIT] seq=%d stream=%d max retries exceeded, abandoning", seqNum, streamID)
-		sm.sendError(streamID, "max retries exceeded")
-		return
-	}
-
-	entry.retries++
 	frameCopy := make([]byte, len(entry.rawFrame))
 	copy(frameCopy, entry.rawFrame)
 	sm.sendBufMu.Unlock()
 
-	log.Printf("[RETRANSMIT] Resending seq=%d stream=%d retry=%d/%d", seqNum, entry.streamID, entry.retries, maxRetries)
+	log.Printf("[RETRANSMIT] Resending seq=%d stream=%d", seqNum, entry.streamID)
 	sm.writeMu.Lock()
 	if err := writeFull(sm.conn, frameCopy); err != nil {
 		log.Printf("[RETRANSMIT] seq=%d stream=%d write error: %v", seqNum, entry.streamID, err)
@@ -1347,7 +1334,7 @@ func main() {
 	log.Printf("Starting as %s", cfg.Role)
 	log.Printf("Serial: %s @ %d baud", cfg.SerialDevice, cfg.BaudRate)
 	log.Printf("Protocol: magic=0x%04X, header=15 bytes, CRC32", protocolMagic)
-	log.Printf("Retransmit: maxRetries=%d, sendBuf=%d entries", maxRetries, sendBufSize)
+	log.Printf("Retransmit: sendBuf=%d entries", sendBufSize)
 	log.Printf("Proxy listen: %s (CONNECT + transparent)", cfg.ProxyListen)
 
 	serialConn, err := openSerial(cfg.SerialDevice, cfg.BaudRate)
