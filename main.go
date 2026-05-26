@@ -517,19 +517,21 @@ func (sm *SerialMultiplexer) handleMsgRetransmit(msg Message) {
 		if streamID, ok := sm.pendingStreams[seqNum]; ok {
 			delete(sm.pendingStreams, seqNum)
 			sm.sendBufMu.Unlock()
-			log.Printf("[RETRANSMIT] seq=%d stream=%d entry evicted from send buffer, aborting", seqNum, streamID)
+			log.Printf("[RETRANSMIT] seq=%d stream=%d SEND_BUF_EVICTED -> MsgError", seqNum, streamID)
 			sm.sendError(streamID, "retransmit entry evicted")
 		} else {
 			sm.sendBufMu.Unlock()
+			log.Printf("[RETRANSMIT] seq=%d SEND_BUF_MISSING no entry anywhere", seqNum)
 		}
 		return
 	}
 
 	frameCopy := make([]byte, len(entry.rawFrame))
 	copy(frameCopy, entry.rawFrame)
+	streamID := entry.streamID
 	sm.sendBufMu.Unlock()
 
-	log.Printf("[RETRANSMIT] Resending seq=%d stream=%d", seqNum, entry.streamID)
+	log.Printf("[RETRANSMIT] seq=%d stream=%d SEND_BUF_HIT resending", seqNum, streamID)
 	sm.writeMu.Lock()
 	if err := writeFull(sm.conn, frameCopy); err != nil {
 		log.Printf("[RETRANSMIT] seq=%d stream=%d write error: %v", seqNum, entry.streamID, err)
@@ -733,6 +735,7 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 		drainAck(ackCh, &clientChunkAck)
 
 		if chunkNum-clientChunkAck >= maxSendWindow {
+			log.Printf("[SERVER] stream=%d WINDOW_FULL chunk=%d ack=%d", streamID, chunkNum, clientChunkAck)
 			select {
 			case ack := <-ackCh:
 				if ack > clientChunkAck {
@@ -1256,6 +1259,10 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 				}
 				flusher.Flush()
 				chunksSince++
+			}
+
+			if n := len(reorder.pending); n > 0 {
+				log.Printf("[TRANSPARENT] stream=%d GAP nextChunk=%d recvChunk=%d pending=%d", streamID, reorder.nextSeq, chunkNum, n)
 			}
 
 			if chunksSince >= ackEveryNChunks {
