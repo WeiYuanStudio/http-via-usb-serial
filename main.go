@@ -219,11 +219,12 @@ type SerialMultiplexer struct {
 	isClient   bool
 	httpsHosts sync.Map
 
-	sendSeq      uint32
-	sendBuf      []sendBufEntry
-	sendBufMu    sync.Mutex
-	processedSeq map[uint32]bool
-	processedMu  sync.Mutex
+	sendSeq       uint32
+	sendBuf       []sendBufEntry
+	sendBufMu     sync.Mutex
+	processedSeq  map[uint32]bool
+	processedMu   sync.Mutex
+	pendingStreams map[uint32]uint32
 }
 
 func writeFull(w io.Writer, buf []byte) error {
@@ -244,8 +245,9 @@ func NewSerialMultiplexer(conn io.ReadWriteCloser, isClient bool) *SerialMultipl
 		conn:         conn,
 		streams:      make(map[uint32]chan Message),
 		isClient:     isClient,
-		sendBuf:      make([]sendBufEntry, sendBufSize),
-		processedSeq: make(map[uint32]bool),
+		sendBuf:        make([]sendBufEntry, sendBufSize),
+		processedSeq:   make(map[uint32]bool),
+		pendingStreams: make(map[uint32]uint32),
 	}
 	if isClient {
 		sm.nextID = 1
@@ -428,6 +430,15 @@ func (sm *SerialMultiplexer) storeSendBuf(seqNum uint32, streamID uint32, frame 
 		retries:  0,
 		used:     true,
 	}
+	sm.pendingStreams[seqNum] = streamID
+	if len(sm.pendingStreams) > sendBufSize*2 {
+		threshold := seqNum - sendBufSize
+		for k := range sm.pendingStreams {
+			if k < threshold {
+				delete(sm.pendingStreams, k)
+			}
+		}
+	}
 }
 
 func (sm *SerialMultiplexer) requestRetransmit(seqNum uint32) {
@@ -499,7 +510,14 @@ func (sm *SerialMultiplexer) handleMsgRetransmit(msg Message) {
 	idx := seqNum % sendBufSize
 	entry := &sm.sendBuf[idx]
 	if !entry.used || entry.seqNum != seqNum {
-		sm.sendBufMu.Unlock()
+		if streamID, ok := sm.pendingStreams[seqNum]; ok {
+			delete(sm.pendingStreams, seqNum)
+			sm.sendBufMu.Unlock()
+			log.Printf("[RETRANSMIT] seq=%d stream=%d entry evicted from send buffer, aborting", seqNum, streamID)
+			sm.sendError(streamID, "retransmit entry evicted")
+		} else {
+			sm.sendBufMu.Unlock()
+		}
 		return
 	}
 
