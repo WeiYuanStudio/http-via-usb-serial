@@ -59,9 +59,8 @@ go build -o http-proxy main.go
 - 序列号(SeqNum): 全局单调递增(uint32)，每帧一个，用于 sendBuf 查找、去重
 - 块号(chunkNum): 流内从0开始的连续序号，仅透明代理流式 MsgData 的 payload 前 4 字节携带，用于接收端排序
 - CRC32: IEEE 802.3 标准，覆盖数据部分，检测传输错误
-- 重传缓冲区(sendBuf): 环形缓冲 2048 条目，按 SeqNum % 2048 索引
+- 重传缓冲区(sendBuf): 环形缓冲 2048 条目，按 SeqNum % 2048 索引，同时存储完整 rawFrame。chunkNum 定向重传通过扫描 sendBuf 比对 rawFrame[15:19] 找到目标帧
 - pendingStreams 映射: seqNum → streamID，sendBuf 条目被覆盖后仍能通知客户端
-- streamChunkToSeq 映射: (streamID, chunkNum) → globalSeqNum，用于 chunkNum 定向重传
 - 数据压缩: 透明代理请求/响应用 gzip 压缩，HTTP 头压缩。MsgData 数据块不压缩
 - 帧同步: 扫描器逐字节查找 0x39C5 magic，通过 msgType 范围校验和 CRC32 过滤误识别
 
@@ -126,7 +125,7 @@ go build -o http-proxy main.go
 #### 流程
 
 1. 发送端每发一帧，将其存入环形发送缓冲区 sendBuf (2048 条目，按 SeqNum 索引)
-2. 同时存入 streamChunkToSeq 映射 (chunkNum → globalSeqNum)，供定向重传查询
+2. 同时存入发送缓冲区，chunkNum 定向重传通过扫描 sendBuf 查找 rawFrame 中的 chunkNum 字段
 3. 接收端读帧后校验 CRC32：
    - CRC 正确：deliver 到上层 (MsgData 走 reorder buffer 按 chunkNum 排序)
    - CRC 错误：

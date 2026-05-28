@@ -229,9 +229,7 @@ type SerialMultiplexer struct {
 	sendBufMu     sync.Mutex
 	processedSeq  map[uint32]bool
 	processedMu   sync.Mutex
-	pendingStreams  map[uint32]uint32
-	streamChunkToSeq map[uint32]map[uint32]uint32
-	chunkToSeqMu     sync.Mutex
+	pendingStreams map[uint32]uint32
 }
 
 func writeFull(w io.Writer, buf []byte) error {
@@ -254,8 +252,7 @@ func NewSerialMultiplexer(conn io.ReadWriteCloser, isClient bool) *SerialMultipl
 		isClient:     isClient,
 		sendBuf:        make([]sendBufEntry, sendBufSize),
 		processedSeq:   make(map[uint32]bool),
-		pendingStreams:  make(map[uint32]uint32),
-		streamChunkToSeq: make(map[uint32]map[uint32]uint32),
+		pendingStreams: make(map[uint32]uint32),
 	}
 	if isClient {
 		sm.nextID = 1
@@ -288,7 +285,6 @@ func (sm *SerialMultiplexer) CloseStream(id uint32) {
 	sm.streamsMu.Lock()
 	delete(sm.streams, id)
 	sm.streamsMu.Unlock()
-	sm.clearChunkSeqs(id)
 }
 
 func (sm *SerialMultiplexer) Send(msg Message) error {
@@ -512,22 +508,17 @@ func (sm *SerialMultiplexer) handleMsgRetransmit(msg Message) {
 	if len(msg.Data) == 8 {
 		streamID := binary.BigEndian.Uint32(msg.Data[0:4])
 		chunkNum := binary.BigEndian.Uint32(msg.Data[4:8])
-		seqNum, ok := sm.lookupChunkSeq(streamID, chunkNum)
-		if !ok {
-			log.Printf("[RETRANSMIT] stream=%d chunk=%d CHUNK_SEQ_NOT_FOUND", streamID, chunkNum)
-			return
-		}
-		sm.retransmitBySeq(seqNum, streamID, chunkNum)
+		sm.retransmitByChunk(streamID, chunkNum)
 		return
 	}
 	if len(msg.Data) < 4 {
 		return
 	}
 	seqNum := binary.BigEndian.Uint32(msg.Data)
-	sm.retransmitBySeq(seqNum, 0, 0)
+	sm.retransmitBySeq(seqNum)
 }
 
-func (sm *SerialMultiplexer) retransmitBySeq(seqNum, streamID, chunkNum uint32) {
+func (sm *SerialMultiplexer) retransmitBySeq(seqNum uint32) {
 	sm.sendBufMu.Lock()
 	idx := seqNum % sendBufSize
 	entry := &sm.sendBuf[idx]
@@ -549,11 +540,7 @@ func (sm *SerialMultiplexer) retransmitBySeq(seqNum, streamID, chunkNum uint32) 
 	sid := entry.streamID
 	sm.sendBufMu.Unlock()
 
-	if chunkNum > 0 {
-		log.Printf("[RETRANSMIT] seq=%d stream=%d chunk=%d SEND_BUF_HIT resending", seqNum, sid, chunkNum)
-	} else {
-		log.Printf("[RETRANSMIT] seq=%d stream=%d SEND_BUF_HIT resending", seqNum, sid)
-	}
+	log.Printf("[RETRANSMIT] seq=%d stream=%d SEND_BUF_HIT resending", seqNum, sid)
 	sm.writeMu.Lock()
 	if err := writeFull(sm.conn, frameCopy); err != nil {
 		log.Printf("[RETRANSMIT] seq=%d stream=%d write error: %v", seqNum, sid, err)
@@ -561,32 +548,39 @@ func (sm *SerialMultiplexer) retransmitBySeq(seqNum, streamID, chunkNum uint32) 
 	sm.writeMu.Unlock()
 }
 
-func (sm *SerialMultiplexer) storeChunkSeq(streamID, chunkNum, seqNum uint32) {
-	sm.chunkToSeqMu.Lock()
-	defer sm.chunkToSeqMu.Unlock()
-	m, ok := sm.streamChunkToSeq[streamID]
-	if !ok {
-		m = make(map[uint32]uint32)
-		sm.streamChunkToSeq[streamID] = m
+func (sm *SerialMultiplexer) retransmitByChunk(streamID, chunkNum uint32) {
+	sm.sendBufMu.Lock()
+	var frameCopy []byte
+	var seqNum uint32
+	for i := 0; i < sendBufSize; i++ {
+		e := sm.sendBuf[i]
+		if !e.used {
+			continue
+		}
+		if len(e.rawFrame) < 19 {
+			continue
+		}
+		if binary.BigEndian.Uint32(e.rawFrame[15:19]) != chunkNum {
+			continue
+		}
+		frameCopy = make([]byte, len(e.rawFrame))
+		copy(frameCopy, e.rawFrame)
+		seqNum = e.seqNum
+		break
 	}
-	m[chunkNum] = seqNum
-}
+	sm.sendBufMu.Unlock()
 
-func (sm *SerialMultiplexer) lookupChunkSeq(streamID, chunkNum uint32) (uint32, bool) {
-	sm.chunkToSeqMu.Lock()
-	defer sm.chunkToSeqMu.Unlock()
-	m, ok := sm.streamChunkToSeq[streamID]
-	if !ok {
-		return 0, false
+	if frameCopy == nil {
+		log.Printf("[RETRANSMIT] stream=%d chunk=%d CHUNK_SEQ_NOT_FOUND", streamID, chunkNum)
+		return
 	}
-	seq, ok := m[chunkNum]
-	return seq, ok
-}
 
-func (sm *SerialMultiplexer) clearChunkSeqs(streamID uint32) {
-	sm.chunkToSeqMu.Lock()
-	defer sm.chunkToSeqMu.Unlock()
-	delete(sm.streamChunkToSeq, streamID)
+	log.Printf("[RETRANSMIT] seq=%d stream=%d chunk=%d SEND_BUF_HIT resending", seqNum, streamID, chunkNum)
+	sm.writeMu.Lock()
+	if err := writeFull(sm.conn, frameCopy); err != nil {
+		log.Printf("[RETRANSMIT] seq=%d stream=%d write error: %v", seqNum, streamID, err)
+	}
+	sm.writeMu.Unlock()
 }
 
 func (sm *SerialMultiplexer) requestRetransmitByChunk(streamID, chunkNum uint32) {
@@ -814,12 +808,10 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 			data := make([]byte, 4+n)
 			binary.BigEndian.PutUint32(data, chunkNum)
 			copy(data[4:], buf[:n])
-			assigned := atomic.LoadUint32(&sm.sendSeq)
 			if sendErr := sm.Send(Message{Type: MsgData, StreamID: streamID, Data: data}); sendErr != nil {
 				log.Printf("Send stream data error: %v", sendErr)
 				return
 			}
-			sm.storeChunkSeq(streamID, chunkNum, assigned)
 			chunkNum++
 		}
 		if err != nil {
