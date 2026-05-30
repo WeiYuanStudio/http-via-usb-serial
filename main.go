@@ -67,6 +67,7 @@ const (
 	largeStreamChunkSize   = 4096
 	sendBufSize            = 2048
 	maxSendWindow          = 32
+	maxRetransmitRetries   = 10
 	ackEveryNChunks        = 1
 )
 
@@ -1267,10 +1268,14 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 
 	reorder := newStreamReorderBuf()
 	var (
-		gapTimer       <-chan time.Time
-		chunksSince    int
-		lastAckedChunk uint32
+		gapTimer             <-chan time.Time
+		retransmitCount      int
+		lastRetransmitChunk  uint32
+		chunksSince          int
+		lastAckedChunk       uint32
 	)
+
+	streamTimeout := time.After(streamChunkTimeout)
 
 	sendAck := func() {
 		ackChunk := reorder.nextSeq - 1
@@ -1295,11 +1300,22 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 		case m = <-ch:
 		case <-gapTimer:
 			gapChunk := reorder.nextSeq
-			log.Printf("[TRANSPARENT] stream=%d retransmit request for chunk=%d", streamID, gapChunk)
+			if gapChunk == lastRetransmitChunk {
+				retransmitCount++
+			} else {
+				retransmitCount = 1
+				lastRetransmitChunk = gapChunk
+			}
+			if retransmitCount > maxRetransmitRetries {
+				log.Printf("[TRANSPARENT] stream=%d max retries exceeded for chunk=%d, aborting", streamID, gapChunk)
+				p.mux.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
+				return
+			}
+			log.Printf("[TRANSPARENT] stream=%d retransmit request for chunk=%d (attempt %d/%d)", streamID, gapChunk, retransmitCount, maxRetransmitRetries)
 			p.mux.requestRetransmitByChunk(streamID, gapChunk)
 			gapTimer = time.After(500 * time.Millisecond)
 			continue
-		case <-time.After(streamChunkTimeout):
+		case <-streamTimeout:
 			log.Printf("[TRANSPARENT] stream=%d chunk timeout", streamID)
 			return
 		}
