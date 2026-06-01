@@ -24,7 +24,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/tarm/serial"
+	"go.bug.st/serial"
+	"go.bug.st/serial/enumerator"
 )
 
 type Config struct {
@@ -1366,7 +1367,7 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 func parseFlags() *Config {
 	cfg := &Config{}
 	flag.StringVar(&cfg.Role, "role", "client", "Role: client or server")
-	flag.StringVar(&cfg.SerialDevice, "serial", "/dev/ttyUSB0", "Serial device path")
+	flag.StringVar(&cfg.SerialDevice, "serial", "", "Serial device path (auto-detect if empty)")
 	flag.IntVar(&cfg.BaudRate, "baud", 115200, "Baud rate")
 	flag.StringVar(&cfg.ProxyListen, "proxy-listen", ":8080", "Proxy listen address (supports CONNECT + transparent)")
 	flag.StringVar(&cfg.ReverseUpstream, "reverse-upstream", "https://api.deepseek.com", "Reverse proxy upstream URL")
@@ -1375,15 +1376,46 @@ func parseFlags() *Config {
 	return cfg
 }
 
-func openSerial(device string, baud int) (*serial.Port, error) {
-	c := &serial.Config{
-		Name:     device,
-		Baud:     baud,
-		Size:     8,
-		StopBits: serial.Stop1,
-		Parity:   serial.ParityNone,
+func autoDetectSerial() string {
+	ports, err := enumerator.GetDetailedPortsList()
+	if err != nil {
+		log.Printf("Failed to enumerate serial ports: %v", err)
+		return ""
 	}
-	return serial.OpenPort(c)
+
+	if len(ports) == 0 {
+		return ""
+	}
+
+	// 优先查找 VID:1A86 PID:55D3 (CH340)
+	for _, port := range ports {
+		if port.IsUSB && port.VID == "1A86" && port.PID == "55D3" {
+			log.Printf("Auto-detected CH343 device: %s (VID=%s PID=%s)", port.Name, port.VID, port.PID)
+			return port.Name
+		}
+	}
+
+	// 如果只有一个串口，使用它
+	if len(ports) == 1 {
+		info := ""
+		if ports[0].IsUSB {
+			info = fmt.Sprintf(" (VID=%s PID=%s)", ports[0].VID, ports[0].PID)
+		}
+		log.Printf("Only one serial port found, using: %s%s", ports[0].Name, info)
+		return ports[0].Name
+	}
+
+	return ""
+}
+
+func openSerial(device string, baud int) (serial.Port, error) {
+	mode := &serial.Mode{
+		BaudRate: baud,
+		DataBits: 8,
+		Parity:   serial.NoParity,
+		StopBits: serial.OneStopBit,
+	}
+	return serial.Open(device, mode)
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,6 +1424,14 @@ func openSerial(device string, baud int) (*serial.Port, error) {
 
 func main() {
 	cfg := parseFlags()
+
+	// 自动检测串口
+	if cfg.SerialDevice == "" {
+		cfg.SerialDevice = autoDetectSerial()
+		if cfg.SerialDevice == "" {
+			log.Fatal("No serial port specified and auto-detection failed. Please use --serial flag.")
+		}
+	}
 
 	if cfg.Role != "client" && cfg.Role != "server" {
 		log.Fatal("role must be 'client' or 'server'")
