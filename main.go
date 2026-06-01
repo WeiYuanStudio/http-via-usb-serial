@@ -1366,14 +1366,31 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 
 func parseFlags() *Config {
 	cfg := &Config{}
-	flag.StringVar(&cfg.Role, "role", "client", "Role: client or server")
+	flag.StringVar(&cfg.Role, "role", "", "Role: client or server (auto-detect if empty)")
 	flag.StringVar(&cfg.SerialDevice, "serial", "", "Serial device path (auto-detect if empty)")
-	flag.IntVar(&cfg.BaudRate, "baud", 115200, "Baud rate")
+	flag.IntVar(&cfg.BaudRate, "baud", 6000000, "Baud rate")
 	flag.StringVar(&cfg.ProxyListen, "proxy-listen", ":8080", "Proxy listen address (supports CONNECT + transparent)")
 	flag.StringVar(&cfg.ReverseUpstream, "reverse-upstream", "https://api.deepseek.com", "Reverse proxy upstream URL")
 	flag.StringVar(&cfg.ReverseListen, "reverse-listen", ":8081", "Reverse proxy listen address (empty to disable)")
 	flag.Parse()
 	return cfg
+}
+
+func autoDetectRole() string {
+	targets := []string{"http://baidu.com", "http://qq.com", "http://alibaba.com"}
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for _, url := range targets {
+		resp, err := client.Head(url)
+		if err == nil {
+			resp.Body.Close()
+			log.Printf("Network available (detected %s), running as server", url)
+			return "server"
+		}
+	}
+
+	log.Printf("No network access detected, running as client")
+	return "client"
 }
 
 func autoDetectSerial() string {
@@ -1431,6 +1448,11 @@ func main() {
 		if cfg.SerialDevice == "" {
 			log.Fatal("No serial port specified and auto-detection failed. Please use --serial flag.")
 		}
+	}
+
+	// 自动检测角色
+	if cfg.Role == "" {
+		cfg.Role = autoDetectRole()
 	}
 
 	if cfg.Role != "client" && cfg.Role != "server" {
