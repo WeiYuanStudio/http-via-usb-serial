@@ -1404,7 +1404,7 @@ func autoDetectSerial() string {
 		return ""
 	}
 
-	// 优先查找 VID:1A86 PID:55D3 (CH340)
+	// 优先查找 VID:1A86 PID:55D3 (CH343)
 	for _, port := range ports {
 		if port.IsUSB && port.VID == "1A86" && port.PID == "55D3" {
 			log.Printf("Auto-detected CH343 device: %s (VID=%s PID=%s)", port.Name, port.VID, port.PID)
