@@ -75,7 +75,6 @@ const (
 var errBadCRC = errors.New("bad CRC")
 
 var autoManagedHeaders = map[string]bool{
-	"content-length":   true,
 	"transfer-encoding": true,
 	"connection":       true,
 	"date":             true,
@@ -859,6 +858,9 @@ func dumpResponseHeaders(resp *http.Response) []byte {
 	buf.WriteByte(' ')
 	buf.WriteString(resp.Status)
 	buf.WriteString("\r\n")
+	if resp.ContentLength > 0 {
+		buf.WriteString(fmt.Sprintf("Content-Length: %d\r\n", resp.ContentLength))
+	}
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			buf.WriteString(k)
