@@ -302,12 +302,8 @@ func (sm *SerialMultiplexer) readLoop() {
 	for {
 		msg, err := sm.readMessageSync()
 		if err != nil {
-			if err == io.EOF {
-				log.Println("Serial connection closed")
-				return
-			}
 			log.Printf("Read message error: %v", err)
-			continue
+			return
 		}
 		sm.dispatch(msg)
 	}
@@ -315,6 +311,7 @@ func (sm *SerialMultiplexer) readLoop() {
 
 func (sm *SerialMultiplexer) readMessageSync() (Message, error) {
 	searchPos := 0
+	consecutiveErrors := 0
 	for {
 		for searchPos+15 <= len(sm.scanBuf) {
 			if binary.BigEndian.Uint16(sm.scanBuf[searchPos:searchPos+2]) != protocolMagic {
@@ -388,9 +385,17 @@ func (sm *SerialMultiplexer) readMessageSync() (Message, error) {
 			if err == io.EOF {
 				return Message{}, err
 			}
-			log.Printf("Serial read error in scan loop: %v", err)
+			consecutiveErrors++
+			if consecutiveErrors%100 == 0 {
+				log.Printf("Serial read error in scan loop: %v (count: %d)", err, consecutiveErrors)
+			}
+			if consecutiveErrors >= 100 {
+				return Message{}, fmt.Errorf("serial device disconnected after %d consecutive errors: %w", consecutiveErrors, err)
+			}
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
+		consecutiveErrors = 0
 	}
 }
 
