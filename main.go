@@ -67,7 +67,8 @@ const (
 	largeResponseThreshold = 4 * 1024 * 1024
 	largeStreamChunkSize   = 4096
 	sendBufSize            = 2048
-	maxSendWindow          = 32
+	maxSendWindow          = 64
+	windowFullTimeout      = 30 * time.Second
 	maxRetransmitRetries   = 10
 	ackEveryNChunks        = 1
 )
@@ -788,17 +789,27 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 
 	var clientChunkAck uint32
 	var chunkNum uint32
+	var windowFullSince time.Time
 
 	buf := make([]byte, chunkSize)
 	for {
 		drainAck(ackCh, &clientChunkAck)
 
 		if chunkNum-clientChunkAck >= maxSendWindow {
+			if windowFullSince.IsZero() {
+				windowFullSince = time.Now()
+			}
+			if time.Since(windowFullSince) > windowFullTimeout {
+				log.Printf("[SERVER] stream=%d WINDOW_FULL timeout after %v, aborting", streamID, windowFullTimeout)
+				sm.sendError(streamID, "window full timeout")
+				return
+			}
 			log.Printf("[SERVER] stream=%d WINDOW_FULL chunk=%d ack=%d", streamID, chunkNum, clientChunkAck)
 			select {
 			case ack := <-ackCh:
 				if ack > clientChunkAck {
 					clientChunkAck = ack
+					windowFullSince = time.Time{} // 重置超时计时器
 				}
 			case <-time.After(500 * time.Millisecond):
 			}
@@ -808,6 +819,7 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 			}
 			continue
 		}
+		windowFullSince = time.Time{} // 窗口恢复，重置超时计时器
 
 		n, err := resp.Body.Read(buf)
 		if n > 0 {

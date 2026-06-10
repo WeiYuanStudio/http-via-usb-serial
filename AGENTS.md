@@ -144,8 +144,9 @@ go build -o http-proxy main.go
 #### 发送窗口流控
 
 - Server 端维护 `clientChunkAck`（client 最新确认的连续 chunkNum）
-- Server 每次发送前检查: `chunkNum - clientChunkAck < maxSendWindow(32)`
+- Server 每次发送前检查: `chunkNum - clientChunkAck < maxSendWindow(64)`
 - 若窗口满：阻塞等待 ACK（500ms 间隔轮询），或 client 主动取消
+- 若窗口满持续超过 `windowFullTimeout`(30s)，Server 发送 MsgError 并关闭流
 - Client 端每收到一个 chunk 发送 `MsgAck(ackChunk = reorder.nextSeq - 1)`
 - ACK 不越过未收到的块（cumulative ACK），缺口端 window 会卡住，配合重传机制填缺口恢复
 
@@ -223,7 +224,8 @@ curl --proxy http://127.0.0.1:8080 https://example.com
 |------|-----|------|
 | `streamChanSize` | 2048 | 流 channel 缓冲区大小 |
 | `sendBufSize` | 2048 | 重传环形缓冲区条目数 |
-| `maxSendWindow` | 32 | 发送窗口大小 (未确认 chunk 上限) |
+| `maxSendWindow` | 64 | 发送窗口大小 (未确认 chunk 上限) |
+| `windowFullTimeout` | 30s | 窗口满超时，超时后取消请求 |
 | `ackEveryNChunks` | 1 | 每收到 N 个 chunk 发一次 ACK |
 | `largeResponseThreshold` | 4 MB | 超过此大小的响应自动切流式传输 |
 | `largeStreamChunkSize` | 4096 | 大文件流式分块大小 |
@@ -240,6 +242,7 @@ curl --proxy http://127.0.0.1:8080 https://example.com
 | `SEND_BUF_EVICTED` | Server handleMsgRetransmit | sendBuf 已覆盖，发 MsgError 通知 |
 | `SEND_BUF_MISSING` | Server handleMsgRetransmit | 任何地方都找不到此帧 |
 | `WINDOW_FULL chunk=... ack=...` | Server handleTransparentStream | 发送窗口满，阻塞等 ACK |
+| `WINDOW_FULL timeout` | Server handleTransparentStream | 窗口满超时 (30s)，取消请求 |
 | `GAP nextChunk=... recvChunk=... pending=...` | Client handleStreamResponse | reorder buffer 检测到缺口 |
 | `CHUNK_SEQ_NOT_FOUND` | Server handleMsgRetransmit | chunkNum 映射不存在 |
 
