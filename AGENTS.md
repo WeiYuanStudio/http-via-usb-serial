@@ -223,7 +223,7 @@ curl --proxy http://127.0.0.1:8080 https://example.com
 | 常量 | 值 | 说明 |
 |------|-----|------|
 | `streamChanSize` | 2048 | 流 channel 缓冲区大小 |
-| `sendBufSize` | 2048 | 重传环形缓冲区条目数 |
+| `sendBufSize` | 8192 | 重传环形缓冲区条目数 |
 | `maxSendWindow` | 64 | 发送窗口大小 (未确认 chunk 上限) |
 | `windowFullTimeout` | 30s | 窗口满超时，超时后取消请求 |
 | `ackEveryNChunks` | 1 | 每收到 N 个 chunk 发一次 ACK |

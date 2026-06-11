@@ -66,7 +66,7 @@ const (
 	streamChunkTimeout     = 300 * time.Second
 	largeResponseThreshold = 4 * 1024 * 1024
 	largeStreamChunkSize   = 4096
-	sendBufSize            = 2048
+	sendBufSize            = 8192
 	maxSendWindow          = 64
 	windowFullTimeout      = 30 * time.Second
 	maxRetransmitRetries   = 10
@@ -579,6 +579,7 @@ func (sm *SerialMultiplexer) retransmitByChunk(streamID, chunkNum uint32) {
 
 	if frameCopy == nil {
 		log.Printf("[RETRANSMIT] stream=%d chunk=%d CHUNK_SEQ_NOT_FOUND", streamID, chunkNum)
+		sm.sendError(streamID, "retransmit chunk not found in sendBuf")
 		return
 	}
 
@@ -1365,6 +1366,12 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 
 			if chunksSince >= ackEveryNChunks {
 				sendAck()
+			}
+
+			// 诊断日志：当pending数量较多时输出reorder buffer状态
+			if len(reorder.pending) > 10 {
+				log.Printf("[TRANSPARENT] stream=%d reorder status: nextSeq=%d pending=%d lastAcked=%d",
+					streamID, reorder.nextSeq, len(reorder.pending), lastAckedChunk)
 			}
 
 		case MsgClose:
