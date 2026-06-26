@@ -37,7 +37,9 @@ go build -o http-proxy main.go
 ./http-proxy --role client \
   --serial /dev/ttyUSB0 \
   --baud 115200 \
-  --proxy-listen :8080
+  --proxy-listen :8080 \
+  --reverse-upstream https://api.deepseek.com \
+  --reverse-listen :8081
 ```
 
 ## 参数说明
@@ -50,7 +52,8 @@ go build -o http-proxy main.go
 | `--proxy-listen` | `:8080` | 统一代理监听地址，同时支持 CONNECT + 透明代理 (留空禁用) |
 | `--reverse-upstream` | `https://api.deepseek.com` | 反向代理上游地址 |
 | `--reverse-listen` | `:8081` | 反向代理监听地址 (留空禁用) |
-| `--allow-lan` | `false` | 是否允许局域网其他设备访问 |
+| `--reverse-upstream-N` | (空) | 额外反向代理上游地址，N=1..10 |
+| `--reverse-listen-N` | (空) | 额外反向代理监听地址，留空则跳过该反代 |
 
 ## 通信协议
 
@@ -216,6 +219,17 @@ curl --proxy http://127.0.0.1:8080 https://example.com
   --reverse-listen :8081
 
 # 内网 GUI 中 API 地址填写 http://127.0.0.1:8081
+```
+
+#### 多个反向代理
+
+```bash
+# 启动时配置多个反向代理，监听不同端口转发到不同上游
+./http-proxy --role client \
+  --proxy-listen :8080 \
+  --reverse-upstream https://api.deepseek.com --reverse-listen :8081 \
+  --reverse-upstream-1 https://api.openai.com --reverse-listen-1 :8082 \
+  --reverse-upstream-2 https://api.anthropic.com --reverse-listen-2 :8083
 ```
 
 ## 关键常量

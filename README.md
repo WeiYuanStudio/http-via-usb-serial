@@ -64,6 +64,8 @@ go build -o http-proxy main.go
 | `--proxy-listen` | `:8080` | 统一代理监听地址，同时支持 CONNECT + 透明代理（留空禁用） |
 | `--reverse-upstream` | `https://api.deepseek.com` | 反向代理上游地址 |
 | `--reverse-listen` | `:8081` | 反向代理监听地址（留空禁用） |
+| `--reverse-upstream-N` | (空) | 额外反向代理上游地址，N=1..10 |
+| `--reverse-listen-N` | (空) | 额外反向代理监听地址，留空则跳过该反代 |
 
 macOS 串口通常为 `/dev/tty.usbserial-*` 或 `/dev/cu.usbserial-*`。
 

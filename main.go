@@ -28,13 +28,17 @@ import (
 	"go.bug.st/serial/enumerator"
 )
 
+type ReversePair struct {
+	Listen   string
+	Upstream string
+}
+
 type Config struct {
-	Role            string
-	SerialDevice    string
-	BaudRate        int
-	ProxyListen     string
-	ReverseUpstream string
-	ReverseListen   string
+	Role         string
+	SerialDevice string
+	BaudRate     int
+	ProxyListen  string
+	Reverses     []ReversePair
 }
 
 type MsgType byte
@@ -1390,15 +1394,38 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 // CLI / 生命周期
 // ---------------------------------------------------------------------------
 
+const maxExtraReverse = 10
+
 func parseFlags() *Config {
 	cfg := &Config{}
+
+	var reverseUpstream, reverseListen string
+	flag.StringVar(&reverseUpstream, "reverse-upstream", "https://api.deepseek.com", "Reverse proxy upstream URL")
+	flag.StringVar(&reverseListen, "reverse-listen", ":8081", "Reverse proxy listen address (empty to disable)")
+
+	extraUpstream := make([]string, maxExtraReverse)
+	extraListen := make([]string, maxExtraReverse)
+	for i := 0; i < maxExtraReverse; i++ {
+		n := i + 1
+		flag.StringVar(&extraUpstream[i], fmt.Sprintf("reverse-upstream-%d", n), "", fmt.Sprintf("Additional reverse proxy upstream URL #%d", n))
+		flag.StringVar(&extraListen[i], fmt.Sprintf("reverse-listen-%d", n), "", fmt.Sprintf("Additional reverse proxy listen address #%d", n))
+	}
+
 	flag.StringVar(&cfg.Role, "role", "", "Role: client or server (auto-detect if empty)")
 	flag.StringVar(&cfg.SerialDevice, "serial", "", "Serial device path (auto-detect if empty)")
 	flag.IntVar(&cfg.BaudRate, "baud", 6000000, "Baud rate")
 	flag.StringVar(&cfg.ProxyListen, "proxy-listen", ":8080", "Proxy listen address (supports CONNECT + transparent)")
-	flag.StringVar(&cfg.ReverseUpstream, "reverse-upstream", "https://api.deepseek.com", "Reverse proxy upstream URL")
-	flag.StringVar(&cfg.ReverseListen, "reverse-listen", ":8081", "Reverse proxy listen address (empty to disable)")
 	flag.Parse()
+
+	if reverseListen != "" && reverseUpstream != "" {
+		cfg.Reverses = append(cfg.Reverses, ReversePair{Listen: reverseListen, Upstream: reverseUpstream})
+	}
+	for i := 0; i < maxExtraReverse; i++ {
+		if extraListen[i] != "" && extraUpstream[i] != "" {
+			cfg.Reverses = append(cfg.Reverses, ReversePair{Listen: extraListen[i], Upstream: extraUpstream[i]})
+		}
+	}
+
 	return cfg
 }
 
@@ -1490,6 +1517,9 @@ func main() {
 	log.Printf("Protocol: magic=0x%04X, header=15 bytes, CRC32", protocolMagic)
 	log.Printf("Retransmit: sendBuf=%d entries", sendBufSize)
 	log.Printf("Proxy listen: %s (CONNECT + transparent)", cfg.ProxyListen)
+	for _, pair := range cfg.Reverses {
+		log.Printf("Reverse proxy: %s -> %s", pair.Listen, pair.Upstream)
+	}
 
 	serialConn, err := openSerial(cfg.SerialDevice, cfg.BaudRate)
 	if err != nil {
@@ -1544,31 +1574,31 @@ func runClient(ctx context.Context, cfg *Config, mux *SerialMultiplexer) {
 		}
 	}()
 
-	if cfg.ReverseListen != "" && cfg.ReverseUpstream != "" {
-		upstreamURL, err := url.Parse(cfg.ReverseUpstream)
+	for _, pair := range cfg.Reverses {
+		upstreamURL, err := url.Parse(pair.Upstream)
 		if err != nil {
-			log.Fatalf("Invalid reverse-upstream URL: %v", err)
+			log.Fatalf("Invalid reverse-upstream URL %q: %v", pair.Upstream, err)
 		}
 		if upstreamURL.Host == "" || upstreamURL.Scheme == "" {
-			log.Fatal("reverse-upstream must be a full URL (e.g. https://api.deepseek.com)")
+			log.Fatalf("reverse-upstream must be a full URL (e.g. https://api.deepseek.com)")
 		}
 
 		wg.Add(1)
-		go func() {
+		go func(listen string, upstream *url.URL) {
 			defer wg.Done()
-			log.Printf("Reverse proxy listening on %s -> %s", cfg.ReverseListen, cfg.ReverseUpstream)
+			log.Printf("Reverse proxy listening on %s -> %s", listen, upstream.String())
 			srv := &http.Server{
-				Addr:    cfg.ReverseListen,
-				Handler: &reverseProxy{mux: mux, upstream: upstreamURL},
+				Addr:    listen,
+				Handler: &reverseProxy{mux: mux, upstream: upstream},
 			}
 			go func() {
 				<-ctx.Done()
 				srv.Close()
 			}()
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("Reverse proxy error: %v", err)
+				log.Fatalf("Reverse proxy %s error: %v", listen, err)
 			}
-		}()
+		}(pair.Listen, upstreamURL)
 	}
 
 	wg.Wait()
