@@ -60,7 +60,7 @@ const (
 // CRC32 covers Data only; header is protected by Magic + resync
 const (
 	protocolMagic      = uint16(0x39C5)
-	maxMessageSize     = uint32(10 * 1024 * 1024)
+	maxMessageSize     = uint32(5 * 1024 * 1024)
 	readBufferSize     = 4096
 	streamChanSize     = 2048
 	connectTimeout     = 10 * time.Second

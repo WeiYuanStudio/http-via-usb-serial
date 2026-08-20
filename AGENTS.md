@@ -245,7 +245,7 @@ curl --proxy http://127.0.0.1:8080 https://example.com
 | `largeStreamChunkSize` | 4096 | 大文件流式分块大小 |
 | `streamChunkSize` | 256 | SSE 流分块大小 |
 | `streamChunkTimeout` | 300s | 流接收超时，超时后断开 |
-| `maxMessageSize` | 10 MB | 单帧最大数据长度 |
+| `maxMessageSize` | 5 MB | 单帧最大数据长度 |
 
 ## 诊断日志关键字
 
