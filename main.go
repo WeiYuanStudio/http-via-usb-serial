@@ -864,7 +864,7 @@ func isHTTPToHTTPSRedirect(resp *http.Response) bool {
 	if location == "" {
 		return false
 	}
-	if !strings.Contains(location, "https") {
+	if !(strings.Contains(location, "https") || strings.Contains(location, "HTTPS")) {
 		return false
 	}
 	u, err := url.Parse(location)
