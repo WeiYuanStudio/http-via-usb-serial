@@ -59,13 +59,13 @@ const (
 // 帧格式: [2B Magic][1B Type][4B StreamID][4B Length][4B SeqNum][Data][4B CRC32]
 // CRC32 covers Data only; header is protected by Magic + resync
 const (
-	protocolMagic      = uint16(0x39C5)
-	maxMessageSize     = uint32(5 * 1024 * 1024)
-	readBufferSize     = 4096
-	streamChanSize     = 2048
-	connectTimeout     = 10 * time.Second
-	proxyTimeout       = 30 * time.Second
-	dialTimeout        = 10 * time.Second
+	protocolMagic          = uint16(0x39C5)
+	maxMessageSize         = uint32(5 * 1024 * 1024)
+	readBufferSize         = 4096
+	streamChanSize         = 2048
+	connectTimeout         = 10 * time.Second
+	proxyTimeout           = 30 * time.Second
+	dialTimeout            = 10 * time.Second
 	streamChunkSize        = 256
 	streamChunkTimeout     = 300 * time.Second
 	largeResponseThreshold = 4 * 1024 * 1024
@@ -73,6 +73,7 @@ const (
 	sendBufSize            = 8192
 	maxSendWindow          = 64
 	windowFullTimeout      = 30 * time.Second
+	streamDispatchTimeout  = 2 * time.Second
 	maxRetransmitRetries   = 10
 	ackEveryNChunks        = 1
 )
@@ -81,9 +82,9 @@ var errBadCRC = errors.New("bad CRC")
 
 var autoManagedHeaders = map[string]bool{
 	"transfer-encoding": true,
-	"connection":       true,
-	"date":             true,
-	"trailer":          true,
+	"connection":        true,
+	"date":              true,
+	"trailer":           true,
 }
 
 type Message struct {
@@ -230,11 +231,11 @@ type SerialMultiplexer struct {
 	isClient   bool
 	httpsHosts sync.Map
 
-	sendSeq       uint32
-	sendBuf       []sendBufEntry
-	sendBufMu     sync.Mutex
-	processedSeq  map[uint32]bool
-	processedMu   sync.Mutex
+	sendSeq        uint32
+	sendBuf        []sendBufEntry
+	sendBufMu      sync.Mutex
+	processedSeq   map[uint32]bool
+	processedMu    sync.Mutex
 	pendingStreams map[uint32]uint32
 }
 
@@ -253,9 +254,9 @@ func writeFull(w io.Writer, buf []byte) error {
 
 func NewSerialMultiplexer(conn io.ReadWriteCloser, isClient bool) *SerialMultiplexer {
 	sm := &SerialMultiplexer{
-		conn:         conn,
-		streams:      make(map[uint32]chan Message),
-		isClient:     isClient,
+		conn:           conn,
+		streams:        make(map[uint32]chan Message),
+		isClient:       isClient,
 		sendBuf:        make([]sendBufEntry, sendBufSize),
 		processedSeq:   make(map[uint32]bool),
 		pendingStreams: make(map[uint32]uint32),
@@ -499,8 +500,17 @@ func (sm *SerialMultiplexer) dispatch(msg Message) {
 	sm.streamsMu.RUnlock()
 
 	if ok {
-		ch <- msg
-		return
+		timer := time.NewTimer(streamDispatchTimeout)
+		defer timer.Stop()
+		select {
+		case ch <- msg:
+			return
+		case <-timer.C:
+			log.Printf("[DISPATCH] stream=%d queue blocked for %v, closing stream", msg.StreamID, streamDispatchTimeout)
+			sm.CloseStream(msg.StreamID)
+			go sm.sendError(msg.StreamID, "stream receive queue blocked")
+			return
+		}
 	}
 
 	if !sm.isClient && (msg.Type == MsgTransparent || msg.Type == MsgConnect) {
@@ -510,7 +520,7 @@ func (sm *SerialMultiplexer) dispatch(msg Message) {
 			return
 		}
 		go sm.handleServerRequest(msg, ch)
-	} else {
+	} else if msg.Type != MsgClose && msg.Type != MsgAck {
 		log.Printf("Unexpected message: stream=%d type=%d", msg.StreamID, msg.Type)
 	}
 }
@@ -571,7 +581,7 @@ func (sm *SerialMultiplexer) retransmitByChunk(streamID, chunkNum uint32) {
 		if len(e.rawFrame) < 19 {
 			continue
 		}
-		if binary.BigEndian.Uint32(e.rawFrame[15:19]) != chunkNum {
+		if e.streamID != streamID || binary.BigEndian.Uint32(e.rawFrame[15:19]) != chunkNum {
 			continue
 		}
 		frameCopy = make([]byte, len(e.rawFrame))
@@ -685,9 +695,20 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 				case MsgAck:
 					if len(m.Data) >= 4 {
 						ackSeq := binary.BigEndian.Uint32(m.Data[:4])
+						// ACK is cumulative; never let an old ACK crowd out the
+						// newest value, otherwise the sender can stall forever at
+						// exactly maxSendWindow outstanding chunks.
 						select {
 						case ackCh <- ackSeq:
 						default:
+							select {
+							case <-ackCh:
+							default:
+							}
+							select {
+							case ackCh <- ackSeq:
+							default:
+							}
 						}
 					}
 				}
@@ -766,12 +787,13 @@ func (sm *SerialMultiplexer) handleTransparent(msg Message, ch chan Message) {
 	}
 }
 
-func drainAck(ackCh <-chan uint32, clientAck *uint32) {
+func drainAck(ackCh <-chan uint32, clientAck *uint32, acked *bool) {
 	for {
 		select {
 		case ack := <-ackCh:
-			if ack > *clientAck {
+			if !*acked || ack > *clientAck {
 				*clientAck = ack
+				*acked = true
 			}
 		default:
 			return
@@ -793,14 +815,19 @@ func (sm *SerialMultiplexer) handleTransparentStream(streamID uint32, resp *http
 	}
 
 	var clientChunkAck uint32
+	var clientAcked bool
 	var chunkNum uint32
 	var windowFullSince time.Time
 
 	buf := make([]byte, chunkSize)
 	for {
-		drainAck(ackCh, &clientChunkAck)
+		drainAck(ackCh, &clientChunkAck, &clientAcked)
 
-		if chunkNum-clientChunkAck >= maxSendWindow {
+		outstanding := chunkNum
+		if clientAcked {
+			outstanding = chunkNum - (clientChunkAck + 1)
+		}
+		if outstanding >= maxSendWindow {
 			if windowFullSince.IsZero() {
 				windowFullSince = time.Now()
 			}
@@ -931,7 +958,12 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 	wg.Add(2)
 	done := make(chan struct{})
 	var doneOnce sync.Once
-	closeDone := func() { doneOnce.Do(func() { close(done) }) }
+	closeDone := func() {
+		doneOnce.Do(func() {
+			close(done)
+			conn.Close()
+		})
+	}
 
 	go func() {
 		defer wg.Done()
@@ -960,32 +992,29 @@ func (sm *SerialMultiplexer) handleConnect(msg Message, ch chan Message) {
 
 	go func() {
 		defer wg.Done()
-		reorder := newStreamReorderBuf()
 		for {
 			select {
 			case m := <-ch:
 				switch m.Type {
 				case MsgData:
-					if err := reorder.writeTo(conn, m.SeqNum, m.Data); err != nil {
+					// Serial delivery is ordered. Global SeqNum is not contiguous
+					// within one stream because other streams share the sequence.
+					if _, err := conn.Write(m.Data); err != nil {
 						log.Printf("Write to remote failed: %v", err)
 						closeDone()
-						conn.Close()
 						return
 					}
 				case MsgClose:
 					closeDone()
-					conn.Close()
 					return
 				case MsgError:
 					log.Printf("Received error for stream %d: %s", msg.StreamID, string(m.Data))
 					closeDone()
-					conn.Close()
 					return
 				default:
 					log.Printf("Unexpected message type %d in CONNECT stream %d", m.Type, msg.StreamID)
 				}
 			case <-done:
-				conn.Close()
 				return
 			}
 		}
@@ -1052,6 +1081,7 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case respMsg = <-ch:
 	case <-time.After(connectTimeout):
 		log.Printf("Connect handshake timeout for stream %d", streamID)
+		p.mux.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
 		clientConn.Write([]byte("HTTP/1.1 504 Gateway Timeout\r\n\r\n"))
 		clientConn.Close()
 		return
@@ -1069,6 +1099,7 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		p.mux.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
 		clientConn.Close()
 		return
 	}
@@ -1077,7 +1108,12 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	wg.Add(2)
 	done := make(chan struct{})
 	var doneOnce sync.Once
-	closeDone := func() { doneOnce.Do(func() { close(done) }) }
+	closeDone := func() {
+		doneOnce.Do(func() {
+			close(done)
+			clientConn.Close()
+		})
+	}
 
 	go func() {
 		defer wg.Done()
@@ -1103,32 +1139,27 @@ func (p *connectProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	go func() {
 		defer wg.Done()
-		reorder := newStreamReorderBuf()
 		for {
 			select {
 			case m := <-ch:
 				switch m.Type {
 				case MsgData:
-					if err := reorder.writeTo(clientConn, m.SeqNum, m.Data); err != nil {
+					if _, err := clientConn.Write(m.Data); err != nil {
 						log.Printf("Write to browser failed: %v", err)
 						closeDone()
-						clientConn.Close()
 						return
 					}
 				case MsgClose:
 					closeDone()
-					clientConn.Close()
 					return
 				case MsgError:
 					log.Printf("Received error for stream %d: %s", streamID, string(m.Data))
 					closeDone()
-					clientConn.Close()
 					return
 				default:
 					log.Printf("Unexpected message type %d in CONNECT stream %d", m.Type, streamID)
 				}
 			case <-done:
-				clientConn.Close()
 				return
 			}
 		}
@@ -1195,6 +1226,12 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	defer p.mux.CloseStream(streamID)
+	remoteClosed := false
+	defer func() {
+		if !remoteClosed {
+			p.mux.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
+		}
+	}()
 
 	compressed, err := compress(dump)
 	if err != nil {
@@ -1221,7 +1258,7 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if msg.Type == MsgResponseHeaders {
-		p.handleStreamResponse(w, req, streamID, ch, msg)
+		remoteClosed = p.handleStreamResponse(w, req, streamID, ch, msg)
 		return
 	}
 
@@ -1259,17 +1296,17 @@ func (p *transparentProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
-func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http.Request, streamID uint32, ch chan Message, headersMsg Message) {
+func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http.Request, streamID uint32, ch chan Message, headersMsg Message) bool {
 	headersData, err := decompress(headersMsg.Data)
 	if err != nil {
 		http.Error(w, "decompress headers failed", http.StatusBadGateway)
-		return
+		return false
 	}
 
 	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(headersData)), req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+		return false
 	}
 	defer resp.Body.Close()
 
@@ -1288,19 +1325,29 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		log.Printf("[TRANSPARENT] stream=%d Flusher not supported, streaming disabled", streamID)
-		return
+		return false
 	}
 
 	reorder := newStreamReorderBuf()
 	var (
-		gapTimer             <-chan time.Time
-		retransmitCount      int
-		lastRetransmitChunk  uint32
-		chunksSince          int
-		lastAckedChunk       uint32
+		gapTimer            <-chan time.Time
+		retransmitCount     int
+		lastRetransmitChunk uint32
+		chunksSince         int
+		lastAckedChunk      uint32
 	)
 
-	streamTimeout := time.After(streamChunkTimeout)
+	idleTimer := time.NewTimer(streamChunkTimeout)
+	defer idleTimer.Stop()
+	resetIdleTimer := func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(streamChunkTimeout)
+	}
 
 	sendAck := func() {
 		ackChunk := reorder.nextSeq - 1
@@ -1333,20 +1380,20 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 			}
 			if retransmitCount > maxRetransmitRetries {
 				log.Printf("[TRANSPARENT] stream=%d max retries exceeded for chunk=%d, aborting", streamID, gapChunk)
-				p.mux.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
-				return
+				return false
 			}
 			log.Printf("[TRANSPARENT] stream=%d retransmit request for chunk=%d (attempt %d/%d)", streamID, gapChunk, retransmitCount, maxRetransmitRetries)
 			p.mux.requestRetransmitByChunk(streamID, gapChunk)
 			gapTimer = time.After(500 * time.Millisecond)
 			continue
-		case <-streamTimeout:
-			log.Printf("[TRANSPARENT] stream=%d chunk timeout", streamID)
-			return
+		case <-idleTimer.C:
+			log.Printf("[TRANSPARENT] stream=%d chunk idle timeout", streamID)
+			return false
 		}
 
 		switch m.Type {
 		case MsgData:
+			resetIdleTimer()
 			if len(m.Data) < 4 {
 				continue
 			}
@@ -1354,9 +1401,8 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 			chunks := reorder.put(chunkNum, m.Data[4:])
 			for _, chunk := range chunks {
 				if _, err := w.Write(chunk); err != nil {
-					log.Printf("[TRANSPARENT] stream=%d write chunk error, sending close to server: %v", streamID, err)
-					p.mux.Send(Message{Type: MsgClose, StreamID: streamID, Data: nil})
-					return
+					log.Printf("[TRANSPARENT] stream=%d write chunk error, cancelling server: %v", streamID, err)
+					return false
 				}
 				flusher.Flush()
 				chunksSince++
@@ -1380,10 +1426,14 @@ func (p *transparentProxy) handleStreamResponse(w http.ResponseWriter, req *http
 
 		case MsgClose:
 			sendAck()
-			return
+			if len(reorder.pending) > 0 {
+				log.Printf("[TRANSPARENT] stream=%d closed with %d out-of-order chunks pending", streamID, len(reorder.pending))
+				return false
+			}
+			return true
 		case MsgError:
 			log.Printf("[TRANSPARENT] stream=%d received error: %s", streamID, string(m.Data))
-			return
+			return true
 		default:
 			log.Printf("[TRANSPARENT] stream=%d unexpected message type %d in stream", streamID, m.Type)
 		}
